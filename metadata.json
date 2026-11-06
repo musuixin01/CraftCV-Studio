@@ -1,0 +1,6 @@
+{
+  "name": "CraftCV Studio — 电子信息与技术校招智能简历工作台",
+  "description": "面向电子信息工程、嵌入式软硬件及互联网技术岗求职者的全栈智能简历制作平台，支持GitHub开源项目一键导入提炼、三套专业A4模板切换、AI经历润色与岗位JD匹配优化及高清矢量PDF导出。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

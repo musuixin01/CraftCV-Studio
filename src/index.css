@@ -1,0 +1,241 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+    --font-body: 'Public Sans', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+    --ease-os26-spring: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-os26-smooth: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  body {
+    font-family: var(--font-body);
+    color: #1d1d1f;
+    background-color: #f2f4f8;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    selection-background-color: rgba(0, 113, 227, 0.16);
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.015em;
+  }
+
+  .font-mono, .tabular-nums {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ============================================================================
+   APPLE OS 26 ("LIQUID GLASS" & SPATIAL STUDIO) DESIGN SYSTEM UTILITIES
+   ============================================================================ */
+
+/* Ambient OS 26 Studio Background Canvas */
+.os26-canvas-bg {
+  background-color: #eef1f6;
+  background-image:
+    radial-gradient(at 15% 10%, rgba(0, 113, 227, 0.055) 0px, transparent 48%),
+    radial-gradient(at 85% 15%, rgba(94, 92, 230, 0.045) 0px, transparent 45%),
+    radial-gradient(at 50% 90%, rgba(52, 199, 89, 0.035) 0px, transparent 50%);
+}
+
+/* OS 26 Translucent Liquid Glass Bar / Floating Capsule */
+.os26-glass-bar {
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: saturate(190%) blur(24px);
+  -webkit-backdrop-filter: saturate(190%) blur(24px);
+  border-color: rgba(15, 23, 42, 0.07);
+}
+
+/* OS 26 Elevated Floating Dock / Popover Surface */
+.os26-floating-dock {
+  background: rgba(255, 255, 255, 0.84);
+  backdrop-filter: saturate(200%) blur(28px);
+  -webkit-backdrop-filter: saturate(200%) blur(28px);
+  box-shadow:
+    0 10px 30px -10px rgba(15, 23, 42, 0.1),
+    0 2px 6px -1px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(15, 23, 42, 0.075);
+}
+
+/* OS 26 Grouped Inspector Card */
+.os26-card {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(15, 23, 42, 0.07);
+  box-shadow:
+    0 2px 10px -3px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.85);
+}
+
+/* OS 26 Tactile Input Field */
+.os26-input {
+  background-color: rgba(242, 244, 248, 0.75);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 0.625rem;
+  color: #1d1d1f;
+  transition:
+    background-color 160ms var(--ease-os26-smooth),
+    border-color 160ms var(--ease-os26-smooth),
+    box-shadow 160ms var(--ease-os26-smooth);
+}
+
+.os26-input:hover {
+  background-color: rgba(242, 244, 248, 0.95);
+  border-color: rgba(15, 23, 42, 0.14);
+}
+
+.os26-input:focus {
+  background-color: #ffffff;
+  border-color: #0071e3;
+  box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+  outline: none;
+}
+
+/* OS 26 Spring Animations */
+@keyframes os26SheetIn {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.992);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes os26ModalIn {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.965);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes os26PopoverIn {
+  0% {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.os26-sheet-enter {
+  animation: os26SheetIn 240ms var(--ease-os26-spring) forwards;
+}
+
+.os26-modal-enter {
+  animation: os26ModalIn 260ms var(--ease-os26-spring) forwards;
+}
+
+.os26-popover-enter {
+  animation: os26PopoverIn 180ms var(--ease-os26-spring) forwards;
+}
+
+.os26-press {
+  transition:
+    transform 140ms var(--ease-os26-spring),
+    background-color 140ms var(--ease-os26-smooth),
+    color 140ms var(--ease-os26-smooth),
+    box-shadow 140ms var(--ease-os26-smooth),
+    opacity 140ms var(--ease-os26-smooth);
+}
+
+.os26-press:active:not(:disabled) {
+  transform: scale(0.965);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .os26-sheet-enter,
+  .os26-modal-enter,
+  .os26-popover-enter {
+    animation: none !important;
+  }
+  .os26-press:active:not(:disabled) {
+    transform: none !important;
+  }
+}
+
+/* Custom subtle Apple-style scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.16);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.28);
+}
+
+/* Vector-crisp A4 Print Stylesheet */
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 0;
+  }
+
+  html, body {
+    width: 210mm;
+    min-height: 297mm;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only-root {
+    display: block !important;
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    z-index: auto !important;
+    width: 210mm !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    transform: none !important;
+  }
+
+  #a4-resume-sheet {
+    width: 210mm !important;
+    min-height: 297mm !important;
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    transform: none !important;
+  }
+}
+
+.pdf-capture-surface #a4-resume-sheet {
+  width: 210mm !important;
+  min-height: 297mm !important;
+  box-shadow: none !important;
+  border: none !important;
+  margin: 0 !important;
+  transform: none !important;
+}
