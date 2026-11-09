@@ -187,16 +187,92 @@
   background: rgba(15, 23, 42, 0.28);
 }
 
+/* ATS-only typography. Preview and image exports retain their selected layout/font.
+   Latin uses system Arial; CJK uses Windows YaHei (or an installed OS fallback).
+   Chrome "Save as PDF" embeds subsets of fonts it actually uses. */
+.ats-print-surface #a4-resume-sheet {
+  font-family: Arial, "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  font-size: 10.5pt !important;
+  line-height: 1.48 !important;
+  font-weight: 400;
+}
+
+.ats-print-surface #a4-resume-sheet :is(h1, h2, h3, h4, .font-display, .font-sans, .font-mono) {
+  font-family: inherit !important;
+}
+
+/* Keep narrow dates, URLs and technical metadata legible in a printed PDF. */
+.ats-print-surface #a4-resume-sheet .font-mono {
+  font-size: max(9.5pt, 0.92em) !important;
+}
+
+.ats-print-surface #a4-resume-sheet header h1 {
+  font-size: 22pt !important;
+  line-height: 1.23 !important;
+  font-weight: 700;
+}
+
+.ats-print-surface #a4-resume-sheet [data-ats-role-title] {
+  font-size: 13pt !important;
+  line-height: 1.3 !important;
+  font-weight: 600;
+}
+
+.ats-print-surface #a4-resume-sheet [data-ats-direction-tags] {
+  font-size: 10pt !important;
+  line-height: 1.3 !important;
+}
+
+.ats-print-surface #a4-resume-sheet section h2 {
+  font-size: 12.5pt !important;
+  line-height: 1.3 !important;
+  font-weight: 700;
+}
+
+.ats-print-surface #a4-resume-sheet .ats-print-entry > div:first-child .font-bold {
+  font-size: 11pt;
+  font-weight: 700;
+}
+
+/* Optional internal rhythm controls. An unset property leaves every template's
+   original spacing intact. These selectors only target marked resume content,
+   never the editor UI or user data. */
+#a4-resume-sheet[data-cv-item-spacing="on"] [data-cv-items] > [data-cv-item] + [data-cv-item] {
+  margin-block-start: var(--cv-item-spacing) !important;
+}
+
+#a4-resume-sheet[data-cv-heading-spacing="on"] [data-cv-section-heading] {
+  margin-block-end: 0 !important;
+}
+
+#a4-resume-sheet[data-cv-heading-spacing="on"] [data-cv-section-heading] + [data-cv-section-body] {
+  margin-block-start: var(--cv-heading-spacing) !important;
+}
+
+#a4-resume-sheet[data-cv-bullet-spacing="on"] [data-cv-bullets] > li + li {
+  margin-block-start: var(--cv-bullet-spacing) !important;
+}
+
+/* The visual classic-ATS template uses -mx-2 / px-2 to enlarge its hover hit
+   area. In the separate printable ATS surface these negative margins add 8px
+   to scrollWidth despite the text being within the paper margins. Remove the
+   interactive gutter in both screen preflight and print; do not widen margins
+   or suppress genuine overflow from text and links. */
+.ats-print-surface #a4-resume-sheet section[data-resume-section] {
+  margin-inline: 0 !important;
+  padding-inline: 0 !important;
+}
+
 /* Vector-crisp A4 Print Stylesheet */
 @media print {
   @page {
     size: A4 portrait;
-    margin: 0;
+    margin: 12mm;
   }
 
   html, body {
-    width: 210mm;
-    min-height: 297mm;
+    width: auto !important;
+    min-height: 0;
     margin: 0 !important;
     padding: 0 !important;
     background: #ffffff !important;
@@ -204,7 +280,7 @@
     print-color-adjust: exact !important;
   }
 
-  .no-print {
+  .no-print, .pdf-image-capture {
     display: none !important;
   }
 
@@ -214,16 +290,80 @@
     left: auto !important;
     top: auto !important;
     z-index: auto !important;
-    width: 210mm !important;
+    width: 186mm !important;
     margin: 0 !important;
     padding: 0 !important;
     box-shadow: none !important;
     transform: none !important;
   }
 
+  /* Keep short education / employment / award entries intact. A long project
+     must NOT be treated as one unbreakable box: this can strand >50mm of white
+     space at the end of a page and push the whole projects section forward. */
+  .ats-print-surface .ats-print-entry {
+    break-inside: avoid-page;
+    page-break-inside: avoid;
+  }
+
+  /* Concise projects inherit the intact-entry rule. Longer projects may
+     continue at complete bullet boundaries rather than forcing a large blank
+     area. Each individual bullet still prefers to remain intact. */
+  .ats-print-surface .ats-print-project-breakable {
+    break-inside: auto;
+    page-break-inside: auto;
+  }
+
+  .ats-print-surface .ats-print-project-entry > div:first-child,
+  .ats-print-surface .ats-print-project-entry > div:nth-child(2),
+  .ats-print-surface .ats-print-project-entry > p {
+    break-after: avoid-page;
+  }
+
+  .ats-print-surface .ats-print-project-entry ul {
+    break-inside: auto;
+  }
+
+  /* The 280px URL cap is intended for visual two-column cards; on a full ATS
+     text line it needlessly wraps long GitHub links and wastes printable space. */
+  .ats-print-surface .ats-print-project-entry [data-ats-project-repo] {
+    max-width: 100% !important;
+  }
+
+  .ats-print-surface .ats-print-project-entry li {
+    break-inside: avoid-page;
+    page-break-inside: avoid;
+    widows: 2;
+    orphans: 2;
+  }
+
+  .ats-print-surface section[data-resume-section="experience"],
+  .ats-print-surface section[data-resume-section="education"],
+  .ats-print-surface section[data-resume-section="awards"],
+  .ats-print-surface section[data-resume-section="summary"] {
+    break-inside: avoid-page;
+    page-break-inside: avoid;
+  }
+
+  /* Target the actual visible heading, not the optional hidden drag controls
+     that may precede it in the DOM. */
+  .ats-print-surface [data-ats-section-heading] {
+    break-after: avoid-page;
+  }
+
+  .ats-print-surface, .ats-print-surface #a4-resume-sheet {
+    width: 186mm !important;
+  }
+
+  /* The page box already provides the full 12mm margin on every printed
+     page. Remove the visual template's extra px/py padding to prevent double
+     margins and unused first-page space. */
+  .ats-print-surface #a4-resume-sheet {
+    padding: 0 !important;
+  }
+
   #a4-resume-sheet {
-    width: 210mm !important;
-    min-height: 297mm !important;
+    width: 186mm !important;
+    min-height: 0 !important;
     box-shadow: none !important;
     border: none !important;
     margin: 0 !important;
@@ -231,11 +371,29 @@
   }
 }
 
-.pdf-capture-surface #a4-resume-sheet {
-  width: 210mm !important;
-  min-height: 297mm !important;
-  box-shadow: none !important;
-  border: none !important;
-  margin: 0 !important;
-  transform: none !important;
+/* Offscreen layouts are measurable in normal mode; printing uses only the ATS surface. */
+@media screen {
+  .pdf-capture-surface #a4-resume-sheet {
+    width: 210mm !important;
+    min-height: 297mm !important;
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    transform: none !important;
+  }
+
+  /* Match the 12mm print margins while preflighting the hidden ATS layout. */
+  .ats-print-surface,
+  .ats-print-surface #a4-resume-sheet {
+    width: 186mm !important;
+  }
+
+  .ats-print-surface #a4-resume-sheet {
+    min-height: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    transform: none !important;
+  }
 }

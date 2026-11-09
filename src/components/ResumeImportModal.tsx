@@ -1,6 +1,9 @@
+import { aiFetch } from '../utils/aiModelClient';
 import React, { useRef, useState } from 'react';
 import { DEFAULT_EE_RESUME } from '../data/defaultResume';
 import { ResumeDocument } from '../types/resume';
+import { validateParsedResume, validateStoredResume } from '../utils/resumeGenerationGuard';
+import { createImportFactLedger, detectImportConflicts, getImportReviewSections } from '../utils/resumeImportReview';
 import {
   FileText,
   FileUp,
@@ -9,7 +12,19 @@ import {
   Sparkles,
   Upload,
   X,
+  AlertTriangle,
+  CheckCircle2,
+  ArrowLeft,
 } from 'lucide-react';
+
+interface PendingAIImport {
+  doc: ResumeDocument;
+  sourceLabel: string;
+  sourceKind: 'ai-file-extraction' | 'ai-pasted-text';
+  versionLabel: string;
+  originalResumeSnapshot: string;
+  capturedAt: string;
+}
 
 interface ResumeImportModalProps {
   isOpen: boolean;
@@ -41,6 +56,45 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingDraft, setPendingDraft] = useState<PendingAIImport | null>(null);
+  const [reviewed, setReviewed] = useState(false);
+  const closeImportModal = () => {
+    if (isParsing) return;
+    setPendingDraft(null);
+    setReviewed(false);
+    setErrorMsg(null);
+    onClose();
+  };
+  const conflicts = pendingDraft && importMode === 'overwrite'
+    ? detectImportConflicts(currentResume, pendingDraft.doc) : [];
+
+  const confirmImportDraft = () => {
+    if (!pendingDraft || !reviewed) return;
+    // Do not allow a delayed model result to replace user edits made after parsing started.
+    if (importMode === 'overwrite' && JSON.stringify(currentResume) !== pendingDraft.originalResumeSnapshot) {
+      setErrorMsg('当前简历已在解析期间发生变化。为防止覆盖新编辑，请取消本次草稿并重新解析。');
+      return;
+    }
+    if (importMode === 'overwrite' && !window.confirm(
+      '已核对 AI 草稿。确定覆盖当前简历吗？原有内容可能被替换，建议事先导出 JSON 备份。'
+    )) return;
+
+    const confirmedDoc: ResumeDocument = {
+      ...pendingDraft.doc,
+      factLedger: createImportFactLedger(
+        pendingDraft.doc,
+        {kind:pendingDraft.sourceKind,label:pendingDraft.sourceLabel},
+        true,
+        pendingDraft.capturedAt,
+      ),
+    };
+    onImportResume(
+      confirmedDoc, importMode,
+      selectedLane || confirmedDoc.basics.title || '通用岗位',
+      pendingDraft.versionLabel,
+    );
+    closeImportModal();
+  };
 
   if (!isOpen) return null;
 
@@ -49,7 +103,15 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
     sourceLabel: string
   ): ResumeDocument => {
     const nowId = Date.now();
+    // Use the template for styling/section configuration only.
+    // Never import another person's demonstration history when extraction is partial.
     const base = JSON.parse(JSON.stringify(DEFAULT_EE_RESUME)) as ResumeDocument;
+    base.education = [];
+    base.projects = [];
+    base.experience = [];
+    base.skills = [];
+    base.awards = [];
+    base.customSections = [];
 
     const extractedBasics = parsed.basics || {};
     base.id = `imported-${nowId}`;
@@ -59,8 +121,8 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
 
     base.basics = {
       ...base.basics,
-      name: extractedBasics.name || base.basics.name,
-      title: extractedBasics.title || selectedLane || base.basics.title,
+      name: extractedBasics.name || '',
+      title: extractedBasics.title || '',
       directionTags: extractedBasics.directionTags || '',
       phone: extractedBasics.phone || '',
       email: extractedBasics.email || '',
@@ -72,8 +134,8 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
       politicalStatus: extractedBasics.politicalStatus || '',
       graduationYear: extractedBasics.graduationYear || '',
       summary: extractedBasics.summary || '',
-      avatarUrl: currentResume.basics.avatarUrl,
-      showAvatar: currentResume.basics.showAvatar,
+      avatarUrl: '',
+      showAvatar: false,
       avatarPosition: currentResume.basics.avatarPosition,
     };
 
@@ -81,7 +143,7 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
       base.education = parsed.education.map((ed: any, idx: number) => ({
         id: `edu-imp-${nowId}-${idx}`,
         school: ed.school || '',
-        degree: ed.degree || '本科',
+        degree: ed.degree || '',
         major: ed.major || '',
         startDate: ed.startDate || '',
         endDate: ed.endDate || '',
@@ -104,7 +166,7 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
       base.projects = parsed.projects.map((pr: any, idx: number) => ({
         id: `proj-imp-${nowId}-${idx}`,
         name: pr.name || '项目经历',
-        role: pr.role || '核心开发者',
+        role: pr.role || '',
         startDate: pr.startDate || '',
         endDate: pr.endDate || '',
         repoUrl: pr.repoUrl || '',
@@ -148,6 +210,8 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
     if (!file) return;
 
     setErrorMsg(null);
+    setPendingDraft(null);
+    setReviewed(false);
     const lowerName = file.name.toLowerCase();
     const baseLabel = file.name.replace(/\.[^.]+$/, '');
 
@@ -157,9 +221,13 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
       reader.onload = () => {
         try {
           const parsed = JSON.parse(String(reader.result));
-          if (parsed && parsed.basics && Array.isArray(parsed.sections)) {
+          const issues = validateStoredResume(parsed);
+          if (issues.length === 0) {
+            if (importMode === 'overwrite' && !window.confirm(
+              '确定用该 JSON 备份替换当前简历吗？请确认已保存目前的编辑内容。'
+            )) return;
             const lane = parsed.basics.title || selectedLane;
-            onImportResume(parsed, importMode, lane, `${baseLabel} 导入版`);
+            onImportResume({ ...parsed, customSections: parsed.customSections ?? [] }, importMode, lane, `${baseLabel} 导入版`);
             onClose();
           } else {
             setErrorMsg('该 JSON 文件不是有效的简历数据格式');
@@ -218,11 +286,14 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
     versionLabel: string
   ) => {
     setIsParsing(true);
+    setPendingDraft(null);
+    setReviewed(false);
     setErrorMsg(null);
-    setStatusMessage('AI 正在深度识别简历排版与经历结构，请稍候...');
+    const originalResumeSnapshot = JSON.stringify(currentResume);
+    setStatusMessage('AI 正在提取原始简历信息，结果不会自动写入当前版本...');
 
     try {
-      const res = await fetch('/api/ai/parse-resume', {
+      const res = await aiFetch('/api/ai/parse-resume', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -233,16 +304,32 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
         throw new Error(data.error || '解析简历失败');
       }
 
-      const doc = buildResumeDocumentFromParsed(data, versionLabel);
-      const targetLane =
-        selectedLane || doc.basics.title || '嵌入式软件工程师';
-      onImportResume(
-        doc,
-        importMode,
-        targetLane,
-        `${doc.basics.name || versionLabel}_导入版`
+      // A successful network response with no usable extraction is not an import.
+      const extracted = Boolean(
+        data?.basics?.name?.trim?.() ||
+        data?.basics?.summary?.trim?.() ||
+        ['education', 'projects', 'experience', 'skills', 'awards'].some(
+          (key) => Array.isArray(data?.[key]) && data[key].length > 0
+        )
       );
-      onClose();
+      if (!extracted) {
+        throw new Error('没有识别出可用的简历内容，尚未创建新简历。请检查文件或改为粘贴文本。');
+      }
+
+      const structureIssues = validateParsedResume(data);
+      if (structureIssues.length) {
+        throw new Error('AI 提取字段无效，原简历已保留：' + structureIssues.slice(0, 3).join('；'));
+      }
+      const doc = buildResumeDocumentFromParsed(data, versionLabel);
+      setPendingDraft({
+        doc,
+        sourceLabel:payload.fileName || versionLabel,
+        sourceKind:payload.rawText && payload.fileName === '粘贴文本简历'
+          ? 'ai-pasted-text' : 'ai-file-extraction',
+        versionLabel:`${doc.basics.name || versionLabel}_导入版`,
+        originalResumeSnapshot,
+        capturedAt:new Date().toISOString(),
+      });
     } catch (err: any) {
       setErrorMsg(err?.message || 'AI 解析简历遇到问题，请重试');
     } finally {
@@ -262,7 +349,7 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
 
   return (
     <div className="no-print fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-md">
-      <div className="os26-floating-dock os26-modal-enter w-full max-w-xl rounded-3xl overflow-hidden shadow-2xl">
+      <div className="os26-floating-dock os26-modal-enter w-full max-w-2xl max-h-[92vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col">
         {/* Modal Header */}
         <div className="px-6 py-4 border-b border-slate-900/[0.06] flex items-center justify-between gap-3">
           <div>
@@ -271,12 +358,12 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
               <span>智能导入外部简历</span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              支持上传 PDF 简历、图片截图、Markdown/TXT 或直接粘贴旧简历文字，AI 自动提取结构化内容
+              支持上传 PDF、图片或文本；AI 先生成待核对草稿，确认前不会修改简历
             </p>
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={closeImportModal}
             disabled={isParsing}
             className="p-1.5 text-slate-400 hover:text-slate-800 rounded-xl hover:bg-slate-900/[0.05] cursor-pointer"
           >
@@ -285,7 +372,98 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
         </div>
 
         {/* Modal Body */}
-        <div className="p-6 space-y-4">
+        <div className="p-6 space-y-4 overflow-y-auto min-h-0">
+          {pendingDraft ? (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="shrink-0 w-9 h-9 rounded-xl bg-[#0071e3]/10 flex items-center justify-center text-[#0071e3]">
+                  <CheckCircle2 className="w-5 h-5"/>
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900">AI 解析草稿已就绪 · 等待人工核对</h3>
+                  <p className="text-xs text-slate-500 mt-1 break-words">
+                    来源：{pendingDraft.sourceLabel}。以下仅为模型识别结果，尚未证明学历、成绩、项目职责或成果真实。
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex gap-2 flex-wrap text-xs">
+                <button type="button" onClick={() => setImportMode('new-slot')}
+                  className={`rounded-xl px-3 py-2 border ${importMode === 'new-slot' ? 'border-[#0071e3] text-[#0071e3] bg-blue-50' : 'border-slate-200 text-slate-600'}`}>
+                  保存为新版本（推荐）
+                </button>
+                <button type="button" onClick={() => setImportMode('overwrite')}
+                  className={`rounded-xl px-3 py-2 border ${importMode === 'overwrite' ? 'border-red-500 text-red-700 bg-red-50' : 'border-slate-200 text-slate-600'}`}>
+                  覆盖当前简历
+                </button>
+              </div>
+
+              {importMode === 'new-slot' && (
+                <label className="text-xs text-slate-600 flex items-center gap-2">
+                  归入岗位
+                  <select value={selectedLane} onChange={(e)=>setSelectedLane(e.target.value)}
+                    className="os26-input flex-1 px-3 py-1.5 text-xs bg-white">
+                    {roleLanes.map((lane)=><option key={lane} value={lane}>{lane}</option>)}
+                  </select>
+                </label>
+              )}
+              {importMode === 'overwrite' && (
+                <div className="rounded-xl bg-amber-50/90 border border-amber-200 p-3 text-xs text-amber-900">
+                  <div className="flex gap-2 items-center font-semibold mb-1">
+                    <AlertTriangle className="w-4 h-4"/> 覆盖操作需再次确认
+                  </div>
+                  {conflicts.length ? (
+                    <>
+                      <p>检测到 {conflicts.length} 处与当前版本不同的同名字段（差异不代表哪一方正确）：</p>
+                      <div className="mt-2 space-y-2 max-h-40 overflow-y-auto">
+                        {conflicts.map((issue,i)=>(
+                          <div key={issue.label+i} className="border-t border-amber-200/70 pt-1 break-words">
+                            <div className="font-semibold">{issue.label}</div>
+                            <div>现有：{issue.original}</div>
+                            <div>AI 草稿：{issue.incoming}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : <p>未发现重点字段差异；这不等于所有事实已经核验。</p>}
+                </div>
+              )}
+
+              <div className="space-y-3 max-h-[38vh] overflow-y-auto pr-1" role="region" aria-label="AI 草稿逐项核对">
+                {getImportReviewSections(pendingDraft.doc).map((section)=>(
+                  <section key={section.title}>
+                    <h4 className="text-xs font-semibold text-slate-800 mb-2">{section.title}</h4>
+                    <dl className="rounded-xl border border-slate-200 bg-white/60 divide-y divide-slate-100">
+                      {section.facts.map((fact)=>(
+                        <div key={fact.path} className="grid grid-cols-[100px_minmax(0,1fr)] gap-3 px-3 py-2 text-xs">
+                          <dt className="text-slate-500">{fact.label}</dt>
+                          <dd className="text-slate-800 whitespace-pre-wrap break-words select-text">{fact.value}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </section>
+                ))}
+              </div>
+
+              <label className="flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer select-none">
+                <input type="checkbox" checked={reviewed} onChange={(event)=>setReviewed(event.target.checked)}
+                  className="mt-0.5 accent-[#0071e3]" />
+                <span>我已核对以上识别内容，并理解“确认草稿”不是学历、成绩、技术成果或本人贡献的第三方认证。导入后仍可修改，来源状态保留为 AI 建议。</span>
+              </label>
+              {errorMsg && <div role="alert" className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700">{errorMsg}</div>}
+              <div className="flex items-center justify-between gap-2">
+                <button type="button" onClick={()=>{setPendingDraft(null);setReviewed(false);setErrorMsg(null);}}
+                  className="flex gap-1 items-center text-xs font-semibold text-slate-600 px-3 py-2 rounded-xl hover:bg-white/80">
+                  <ArrowLeft className="w-3.5 h-3.5"/> 返回重新识别
+                </button>
+                <button type="button" onClick={confirmImportDraft} disabled={!reviewed}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-white bg-[#0071e3] disabled:opacity-40 disabled:cursor-not-allowed">
+                  {importMode === 'overwrite' ? '核对完成 · 确认覆盖' : '核对完成 · 新建简历'}
+                </button>
+              </div>
+            </div>
+          ) : (
+          <>
           {/* 1. Import Destination Strategy */}
           <div className="space-y-2">
             <label className="block text-xs font-semibold text-slate-700">
@@ -344,6 +522,11 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
               </div>
             )}
           </div>
+
+          <p className="rounded-xl bg-blue-50/70 border border-blue-100 px-3 py-2 text-[11px] text-slate-700 leading-relaxed">
+            AI 解析会将本次选择的文件或粘贴文字发送到顶部所选模型。云端服务商可能在本机以外处理资料；
+            请确认您有权提供这些内容。仅需本地处理时，请先选用支持相应格式的本地模型。
+          </p>
 
           {/* 2. Segmented Tab Switcher: Upload File vs Paste Text */}
           <div className="p-1 bg-slate-900/[0.05] rounded-xl grid grid-cols-2 gap-1">
@@ -444,7 +627,7 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
                   ) : (
                     <>
                       <Sparkles className="w-3.5 h-3.5" />
-                      <span>AI 解析文本并导入</span>
+                      <span>AI 解析文本并生成草稿</span>
                     </>
                   )}
                 </button>
@@ -453,9 +636,11 @@ export const ResumeImportModal: React.FC<ResumeImportModalProps> = ({
           )}
 
           {errorMsg && (
-            <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+            <div role="alert" className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
               {errorMsg}
             </div>
+          )}
+          </>
           )}
         </div>
       </div>

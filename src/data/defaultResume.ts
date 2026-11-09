@@ -1,4 +1,4 @@
-import { ResumeDocument } from '../types/resume';
+import type { ResumeDocument } from '../types/resume';
 
 export const AVATAR_PRESETS = {
   maleEE: '/src/assets/images/avatar_ee_candidate_1793950974558.jpg',
@@ -143,7 +143,7 @@ export const DEFAULT_EE_RESUME: ResumeDocument = {
       endDate: '2025.06',
       techStack: ['系统监测', '异常排查', '回归验证'],
       bullets: [
-        '负责业务系统运行监测与线上异常排查，按异常捕获、场景复现、配置及环境定位、回归验证处理问题；排查客户端兼容与网络故障，记录典型现象及处理步骤。',
+        '负责业务系统运行监测和线上异常排查，完成场景复现、环境定位与回归验证；整理典型故障处理记录。',
       ],
     },
   ],
@@ -187,104 +187,15 @@ export const DEFAULT_EE_RESUME: ResumeDocument = {
     template: 'pdf-classic',
     accentColor: '#666666',
     fontSize: 'md',
-    lineHeight: 'normal',
+    lineHeight: 'tight',
     pageMargin: 'standard',
     showPageBreakGuide: true,
     showIcons: true,
   },
 };
 
-// Exact verbatim data from the user's uploaded PDF for 1-click switching
-export const UPLOADED_PDF_EXACT_RESUME: ResumeDocument = {
-  ...DEFAULT_EE_RESUME,
-  id: 'uploaded-pdf-xinhongen',
-  versionName: '上传PDF原版内容（信宏恩）',
-  basics: {
-    ...DEFAULT_EE_RESUME.basics,
-    name: '信宏恩',
-    title: '嵌入式软件工程师',
-    directionTags: 'MCU 固件 / 实时系统 / 智能控制',
-    phone: '15516885538',
-    email: 'musuixin01@gmail.com',
-    github: 'github.com/musuixin01',
-    schoolTag: '郑州升达经贸管理学院',
-    statusTag: '电子信息工程 · 2027 届本科 · 随时到岗',
-    summary:
-      '具备 MSPM0G3507、STM32F103 固件开发与实机联调经验，参与实时监测终端和智能车控制系统开发；熟悉 FreeRTOS、外设驱动、PID 控制及四层 PCB 设计。',
-  },
-  education: [
-    {
-      id: 'edu-pdf-1',
-      school: '郑州升达经贸管理学院',
-      degree: '本科',
-      major: '电子信息工程（本科）',
-      startDate: '2025.07',
-      endDate: '2027.06',
-      gpa: '3.87/5.00（均分 88.75）',
-      ranking: '',
-      courses: '嵌入式微控制器、数字信号处理、模拟电子技术、FPGA 系统设计',
-      honors: '每学期获校级二等奖学金',
-    },
-    {
-      id: 'edu-pdf-2',
-      school: '信阳职业技术学院',
-      degree: '专科',
-      major: '软件技术（Web 开发与设计 · 专科）',
-      startDate: '2022.07',
-      endDate: '2025.06',
-      gpa: '3.85/5.00（均分 88.54）',
-      ranking: '',
-      courses: '软件建模、面向对象程序设计、程序设计基础、软件测试',
-      honors: '每学期获校级一等奖学金',
-    },
-  ],
-  experience: [
-    {
-      id: 'exp-pdf-1',
-      company: '中科华积电（郑州）科技有限公司',
-      position: '硬件研发实习生（FPGA / PCB）',
-      department: '',
-      location: '郑州',
-      startDate: '2025.12',
-      endDate: '2026.01',
-      techStack: ['FPGA', 'PCB', 'AD20'],
-      bullets: [
-        '依据芯片资料核对多电源域管脚、Bank 电压及 JTAG/EPCS4 配置接口；使用 AD20 建立原理图符号与焊盘封装，参与四层板模块化布局布线、关键信号检查和工程文档归档。',
-      ],
-    },
-    {
-      id: 'exp-pdf-2',
-      company: '郑州市库课教育咨询有限公司',
-      position: '软件工程师实习生（技术部）',
-      department: '',
-      location: '郑州',
-      startDate: '2024.08',
-      endDate: '2025.06',
-      techStack: ['运行监测', '异常排查'],
-      bullets: [
-        '负责业务系统运行监测与线上异常排查，按异常捕获、场景复现、配置及环境定位、回归验证处理问题；排查客户端兼容与网络故障，记录典型现象及处理步骤。',
-      ],
-    },
-  ],
-  awards: [
-    {
-      id: 'aw-pdf-1',
-      title: '计算机软件测试员职业技能等级证书',
-      issuer: '',
-      date: '',
-      level: '三级 / 高级工',
-      description: '',
-    },
-    {
-      id: 'aw-pdf-2',
-      title: '2023 年河南省高职技能大赛软件测试赛项团体三等奖',
-      issuer: '',
-      date: '',
-      level: '',
-      description: '',
-    },
-  ],
-};
+// Do not commit real resumes or contact details as built-in presets.
+// Users import personal documents locally using the file import dialog.
 
 export const DEMO_GITHUB_REPOS = [
   {

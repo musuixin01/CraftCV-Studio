@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   AISkill,
-  DEFAULT_AI_SKILLS,
+
   loadAISkills,
   loadAutoSkillMode,
   loadSelectedSkillIds,
@@ -20,7 +20,7 @@ import {
   ChevronUp,
   FileUp,
   Plus,
-  RotateCcw,
+
   Sparkles,
   Trash2,
 } from 'lucide-react';
@@ -43,7 +43,7 @@ export const AISkillLibraryCard: React.FC<AISkillLibraryCardProps> = ({
   const [newSkillCategory, setNewSkillCategory] = useState('自定义技能');
   const [newSkillDesc, setNewSkillDesc] = useState('');
   const [newSkillMarkdown, setNewSkillMarkdown] = useState(
-    `# 技能名称：自定义专业简历优化规范\n\n## 1. 核心术语要求\n- 突出核心芯片架构、外设协议与软件工程规范。\n\n## 2. 句式与量化准则\n- 每条以强有力动词开头，补充具体性能指标并用 **粗体** 标注。`
+    `# 技能名称：自定义简历写作技能\n\n## 1. 写作重点\n- 结合岗位需求，突出真实承担的职责、方法与实际交付价值。\n\n## 2. 事实边界\n- 只润色已有经历，不编造任职、能力、数字或测试结果。`
   );
 
   useEffect(() => {
@@ -152,13 +152,6 @@ export const AISkillLibraryCard: React.FC<AISkillLibraryCardProps> = ({
     notifySkillsChanged();
   };
 
-  const handleResetBuiltIn = () => {
-    const custom = skills.filter((s) => !s.isBuiltIn);
-    const merged = [...DEFAULT_AI_SKILLS, ...custom];
-    setSkills(merged);
-    saveAISkills(merged);
-    notifySkillsChanged();
-  };
 
   const activeSkills = skills.filter((s) => selectedSkillIds.includes(s.id));
 
@@ -213,7 +206,7 @@ export const AISkillLibraryCard: React.FC<AISkillLibraryCardProps> = ({
               <span>AI 技能库与智能路由中心</span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              内置 {skills.length} 项专业 SKILL.md 规范 ·{' '}
+              当前有 {skills.length} 项自定义 SKILL.md 技能 ·{' '}
               {autoSkillMode
                 ? '当前由 AI 根据优化类目智能挑选最匹配的技能阅读'
                 : `当前手动指定阅读 ${activeSkills.length} 项技能`}
@@ -344,19 +337,15 @@ export const AISkillLibraryCard: React.FC<AISkillLibraryCardProps> = ({
       <div className="os26-card rounded-2xl overflow-hidden">
         <div className="px-4 py-3 bg-slate-900/[0.025] border-b border-slate-900/[0.06] flex items-center justify-between gap-2">
           <span className="text-xs font-bold text-slate-800">
-            全部专业技能包 · 点击卡片可勾选或展开编辑 SKILL.md 规则
-          </span>
-          <button
-            type="button"
-            onClick={handleResetBuiltIn}
-            className="text-[11px] font-medium text-slate-500 hover:text-slate-900 flex items-center gap-1 cursor-pointer"
-          >
-            <RotateCcw className="w-3 h-3" />
-            <span>恢复内置默认规则</span>
-          </button>
+            我的自定义技能包 · 点击卡片选择或编辑 SKILL.md 规则          </span>
         </div>
 
         <div className="p-3.5 space-y-2.5">
+          {skills.length === 0 && (
+            <div className="py-7 text-center text-xs text-slate-500">
+              暂无自定义技能包。可在上方新建或导入；即使不创建，AI 也会按统一简历写作规范润色。
+            </div>
+          )}
           {skills.map((sk) => {
             const isSelected = selectedSkillIds.includes(sk.id);
             const isInspecting = inspectingSkillId === sk.id;

@@ -26,7 +26,7 @@ interface ResumeManagerPanelProps {
   onBranchSlotVersion: (sourceSlotId: string, customNote?: string) => void;
   onCreateSlotInLane: (
     roleCategory: string,
-    templateSource: 'current' | 'ee-default' | 'pdf-exact',
+    templateSource: 'current' | 'ee-default',
     customName?: string,
     targetCompany?: string
   ) => void;
@@ -40,6 +40,7 @@ interface ResumeManagerPanelProps {
   onDeleteRoleLane: (laneName: string) => void;
   onExportSlotJSON: (slot: ResumeSlot) => void;
   onOpenImportModal?: () => void;
+  onOpenMasterCompose?: () => void;
 }
 
 const PRESET_ROLE_LANES = [
@@ -74,6 +75,7 @@ export const ResumeManagerPanel: React.FC<ResumeManagerPanelProps> = ({
   onDeleteRoleLane,
   onExportSlotJSON,
   onOpenImportModal,
+  onOpenMasterCompose,
 }) => {
   const [selectedLaneFilter, setSelectedLaneFilter] = useState<string>('ALL');
   const [addingLane, setAddingLane] = useState(false);
@@ -87,7 +89,7 @@ export const ResumeManagerPanel: React.FC<ResumeManagerPanelProps> = ({
   const [creatingInLane, setCreatingInLane] = useState<string | null>(null);
   const [newResumeName, setNewResumeName] = useState('');
   const [newResumeCompany, setNewResumeCompany] = useState('');
-  const [newResumeSource, setNewResumeSource] = useState<'current' | 'ee-default' | 'pdf-exact'>('current');
+  const [newResumeSource, setNewResumeSource] = useState<'current' | 'ee-default'>('current');
 
   // Editing specific slot metadata inline
   const [editingSlotId, setEditingSlotId] = useState<string | null>(null);
@@ -184,6 +186,14 @@ export const ResumeManagerPanel: React.FC<ResumeManagerPanelProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+
+            {onOpenMasterCompose && (
+              <button type="button" onClick={onOpenMasterCompose}
+                className="os26-press px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer">
+                <Sparkles className="w-3.5 h-3.5"/>
+                <span>从母版生成岗位版</span>
+              </button>
+            )}
             {onOpenImportModal && (
               <button
                 type="button"
@@ -436,17 +446,12 @@ export const ResumeManagerPanel: React.FC<ResumeManagerPanelProps> = ({
                     <label className="block text-[11px] font-semibold text-slate-500 mb-1.5">
                       选择初始内容基底（会自动将求职意向设为「{lane}」）
                     </label>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       {[
                         {
                           id: 'current',
                           title: '基于当前编辑中的简历',
                           desc: '复制当前画面中的内容继续修改',
-                        },
-                        {
-                          id: 'pdf-exact',
-                          title: '信宏恩 PDF 原版基底',
-                          desc: '使用上传的 PDF 1:1 原始简历内容',
                         },
                         {
                           id: 'ee-default',
@@ -458,7 +463,7 @@ export const ResumeManagerPanel: React.FC<ResumeManagerPanelProps> = ({
                           key={opt.id}
                           type="button"
                           onClick={() =>
-                            setNewResumeSource(opt.id as 'current' | 'ee-default' | 'pdf-exact')
+                            setNewResumeSource(opt.id as 'current' | 'ee-default')
                           }
                           className={`p-2.5 rounded-xl text-left border transition-all cursor-pointer ${
                             newResumeSource === opt.id

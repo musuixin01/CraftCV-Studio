@@ -1,7 +1,18 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { ResumeDocument, SectionColumn, SectionConfig, SectionType } from '../types/resume';
 import { AIOptimizeTarget } from './AIOptimizeModal';
+import { TEMPLATE_CATALOG } from '../data/templateCatalog';
+import { sectionGapPx } from '../utils/sectionSpacing';
+import { isLongAtsProject } from '../utils/atsPagination';
+import { internalSpacingCssProps } from '../utils/internalSpacing';
 import { ArrowDown, ArrowLeftRight, ArrowUp, GripVertical, Minimize2, Sparkles, User } from 'lucide-react';
+import { buildOriginalReviewParts, type PairedTextDiff } from '../utils/textDiff';
+
+/** Read-only side-by-side comparison; not part of exported PDF/ATS rendering. */
+export const ResumeDiffContext = createContext<{
+  side: 'before' | 'after';
+  byText: ReadonlyMap<string, PairedTextDiff>;
+} | null>(null);
 
 export interface PageMetrics {
   heightPx: number;
@@ -11,6 +22,8 @@ export interface PageMetrics {
 
 interface ResumePreviewProps {
   resume: ResumeDocument;
+  /** Unique DOM ID when rendering multiple read-only A4 documents together. */
+  previewId?: string;
   onSelectSection?: (sectionId: string) => void;
   onMoveSectionInView?: (sectionId: string, direction: -1 | 1, isTwoColumn: boolean) => void;
   onToggleSectionColumn?: (sectionId: string) => void;
@@ -18,7 +31,7 @@ interface ResumePreviewProps {
   onToggleAvatarColumn?: () => void;
   onInlineUpdateResume?: (updater: (prev: ResumeDocument) => ResumeDocument) => void;
   onAutoFitOnePage?: () => void;
-  onPageMetricsChange?: (metrics: PageMetrics) => void;
+  onPageMetricsChange?: (metrics: PageMetrics, measuredResume: ResumeDocument) => void;
   onRequestAIOptimize?: (target: AIOptimizeTarget) => void;
 }
 
@@ -102,13 +115,36 @@ const InlineEditableText: React.FC<{
 }> = ({ value, onSave, multiline = false, className = '', placeholder = '', richRender = false }) => {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
+  const comparison = useContext(ResumeDiffContext);
 
   useEffect(() => {
     setDraft(value);
   }, [value]);
 
   if (!onSave) {
-    return <span className={className}>{richRender ? renderRichText(value || placeholder) : value || placeholder}</span>;
+    // Only the ORIGINAL A4 carries review annotations. The proposed A4 is
+    // deliberately clean, matching what would be saved/exported on approval.
+    const highlighted = comparison?.side === 'before' ? comparison.byText.get(value) : undefined;
+    if (highlighted) {
+      const parts = buildOriginalReviewParts(highlighted);
+      return (
+        <span className={className + ' whitespace-pre-wrap break-words'}>
+          {parts.map((part, index) => (
+            <span key={index}
+              title={part.kind === 'removed' ? '原文中将删去或替换的文字' : part.kind === 'added' ? '建议新增或替换为的文字，仅用于审阅' : undefined}
+              className={part.kind === 'removed'
+                ? 'rounded-[2px] bg-rose-100 text-rose-800 line-through decoration-rose-600'
+                : part.kind === 'added'
+                  ? 'rounded-[2px] bg-sky-100 text-sky-900 border-b border-sky-400 font-semibold'
+                  : ''}>
+              {part.kind === 'added' ? '＋' : ''}{part.text}
+            </span>
+          ))}
+        </span>
+      );
+    }
+    // Read-only and export previews must never display editor placeholder text as resume content.
+    return <span className={className}>{richRender ? renderRichText(value) : value}</span>;
   }
 
   if (editing) {
@@ -162,15 +198,31 @@ const InlineEditableText: React.FC<{
     );
   }
 
+  const startEditing = () => {
+    setDraft(value);
+    setEditing(true);
+  };
+
   return (
     <span
-      onDoubleClick={(e) => {
+      role="button"
+      tabIndex={0}
+      aria-label={'编辑：' + (value || placeholder || '空白字段').slice(0, 60)}
+      data-inline-editable="true"
+      onClick={(e) => {
+        // Inline edit takes priority; clicking elsewhere within a section opens its inspector.
         e.stopPropagation();
-        setDraft(value);
-        setEditing(true);
+        startEditing();
       }}
-      title="双击直接在纸张上修改文字（单击定位左侧面板）"
-      className={`${className} hover:bg-blue-500/[0.07] rounded-xs transition-colors`}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+          startEditing();
+        }
+      }}
+      title="单击直接修改，Enter 确认，Esc 取消"
+      className={className + ' cursor-text hover:bg-blue-500/[0.08] focus-visible:bg-blue-500/[0.08] focus-visible:outline focus-visible:outline-1 focus-visible:outline-blue-500 rounded-xs transition-colors'}
     >
       {richRender ? renderRichText(value || placeholder) : value || placeholder}
     </span>
@@ -179,6 +231,7 @@ const InlineEditableText: React.FC<{
 
 export const ResumePreview: React.FC<ResumePreviewProps> = ({
   resume,
+  previewId = 'a4-resume-sheet',
   onSelectSection,
   onMoveSectionInView,
   onToggleSectionColumn,
@@ -190,8 +243,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
   onRequestAIOptimize,
 }) => {
   const { basics, sections, education, projects, experience, skills, awards, customSections, style } = resume;
+  const { vars: rhythmVars, ...rhythmAttributes } = internalSpacingCssProps(style);
   const [imgError, setImgError] = useState(false);
   const [draggedSecId, setDraggedSecId] = useState<string | null>(null);
+  const draggedSecRef = useRef<string | null>(null);
   const [dragOverSecId, setDragOverSecId] = useState<string | null>(null);
   const [fillPercentState, setFillPercentState] = useState<number>(92);
   const [isOverflowingOnePage, setIsOverflowingOnePage] = useState<boolean>(false);
@@ -235,7 +290,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         heightPx: Math.round(ratio * 1122.5),
         isOverflowing,
         fillPercent,
-      });
+      }, resume);
     };
 
     updateMetrics();
@@ -265,14 +320,170 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         ? 'px-12 py-10'
         : 'px-9 py-8';
 
-  const sectionGapClass =
-    style.pageMargin === 'compact'
-      ? 'space-y-3.5'
-      : style.pageMargin === 'generous'
-        ? 'space-y-6'
-        : 'space-y-4.5';
-
   const visibleSections = sections.filter((s) => s.visible);
+
+  // Shared single-click field editors keep the document model as the only source
+  // of truth. A field is edited in place; a section background opens its inspector.
+  const editText = (
+    value: string,
+    update: (doc: ResumeDocument, next: string) => ResumeDocument,
+    options: { multiline?: boolean; richRender?: boolean; placeholder?: string } = {},
+  ) => (
+    <InlineEditableText
+      value={value || ''}
+      onSave={onInlineUpdateResume ? (next) => onInlineUpdateResume((doc) => update(doc, next)) : undefined}
+      {...options}
+    />
+  );
+
+  type BasicTextField =
+    | 'name' | 'title' | 'directionTags' | 'phone' | 'email' | 'github'
+    | 'website' | 'location' | 'graduationYear' | 'politicalStatus'
+    | 'schoolTag' | 'statusTag' | 'summary';
+  const editBasic = (field: BasicTextField, display?: string) =>
+    editText(display ?? basics[field] ?? '', (doc, next) => ({
+      ...doc, basics: { ...doc.basics, [field]: next },
+    }), { multiline: field === 'summary', richRender: field === 'summary' });
+
+  const editItem = (
+    collection: 'education' | 'projects' | 'experience' | 'skills' | 'awards',
+    itemId: string,
+    field: string,
+    value: string,
+    options: { multiline?: boolean; richRender?: boolean; asList?: boolean } = {},
+  ) => {
+    const { asList, ...textOptions } = options;
+    return editText(value, (doc, next) => {
+      const updated = asList ? next.split(/[,，、/；;|]+/).map((x) => x.trim()).filter(Boolean) : next;
+      switch (collection) {
+        case 'education':
+          return { ...doc, education: doc.education.map((item) => item.id === itemId ? { ...item, [field]: updated } : item) };
+        case 'projects':
+          return { ...doc, projects: doc.projects.map((item) => item.id === itemId ? { ...item, [field]: updated } : item) };
+        case 'experience':
+          return { ...doc, experience: doc.experience.map((item) => item.id === itemId ? { ...item, [field]: updated } : item) };
+        case 'skills':
+          return { ...doc, skills: doc.skills.map((item) => item.id === itemId ? { ...item, [field]: updated } : item) };
+        case 'awards':
+          return { ...doc, awards: doc.awards.map((item) => item.id === itemId ? { ...item, [field]: updated } : item) };
+      }
+    }, textOptions);
+  };
+
+
+  const visibleBulletIndex = (bullets: string[], visibleIndex: number): number => {
+    let seen = -1;
+    for (let i = 0; i < bullets.length; i += 1) {
+      if (!bullets[i]) continue;
+      seen += 1;
+      if (seen === visibleIndex) return i;
+    }
+    return -1;
+  };
+
+  const editBullet = (
+    collection: 'projects' | 'experience',
+    itemId: string,
+    index: number,
+    value: string,
+  ) => editText(value, (doc, next) => (
+    collection === 'projects'
+      ? { ...doc, projects: doc.projects.map((item) =>
+          item.id === itemId ? { ...item, bullets: item.bullets.map((bullet, i) => i === visibleBulletIndex(item.bullets, index) ? next : bullet) } : item) }
+      : { ...doc, experience: doc.experience.map((item) =>
+          item.id === itemId ? { ...item, bullets: item.bullets.map((bullet, i) => i === visibleBulletIndex(item.bullets, index) ? next : bullet) } : item) }
+  ), { multiline: true, richRender: true });
+
+  const editCustomField = (
+    customSectionId: string,
+    itemId: string,
+    field: 'heading' | 'subheading' | 'date',
+    value: string,
+  ) => editText(value, (doc, next) => ({
+    ...doc,
+    customSections: doc.customSections.map((section) =>
+      section.id === customSectionId
+        ? { ...section, items: section.items.map((item) =>
+            item.id === itemId ? { ...item, [field]: next } : item) }
+        : section),
+  }));
+
+  const editCustomBullet = (
+    customSectionId: string,
+    itemId: string,
+    index: number,
+    value: string,
+  ) => editText(value, (doc, next) => ({
+    ...doc,
+    customSections: doc.customSections.map((section) =>
+      section.id === customSectionId
+        ? { ...section, items: section.items.map((item) =>
+            item.id === itemId
+              ? { ...item, bullets: item.bullets.map((bullet, i) => i === visibleBulletIndex(item.bullets, index) ? next : bullet) }
+              : item) }
+        : section),
+  }), { multiline: true, richRender: true });
+
+  const editSectionTitle = (sec: SectionConfig) =>
+    editText(sec.title, (doc, next) => ({
+      ...doc,
+      sections: doc.sections.map((section) => section.id === sec.id ? { ...section, title: next } : section),
+    }));
+
+  const editSectionEnglishTitle = (sec: SectionConfig) =>
+    editText(sec.englishTitle || '', (doc, next) => ({
+      ...doc,
+      sections: doc.sections.map((section) => section.id === sec.id ? { ...section, englishTitle: next } : section),
+    }));
+
+
+  // A single HTML5 drag contract for every native layout. Preview sections,
+  // not the inline-editable content inside them, own reordering.
+  const clearSectionDrag = () => {
+    draggedSecRef.current = null;
+    setDraggedSecId(null);
+    setDragOverSecId(null);
+  };
+
+  const getSectionDragProps = (sectionId: string, targetColumn?: SectionColumn) => ({
+    'data-section-id': sectionId,
+    draggable: Boolean(onReorderSectionsDirect),
+    onDragStart: (e: React.DragEvent<HTMLElement>) => {
+      if (!onReorderSectionsDirect) return;
+      // Editing/selection inside an input must not start a module drag.
+      if ((e.target as HTMLElement).closest('input, textarea, [contenteditable="true"]')) {
+        e.preventDefault();
+        return;
+      }
+      draggedSecRef.current = sectionId;
+      setDraggedSecId(sectionId);
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', sectionId);
+    },
+    onDragOver: (e: React.DragEvent<HTMLElement>) => {
+      if (!onReorderSectionsDirect) return;
+      const from = draggedSecRef.current;
+      if (!from || from === sectionId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      if (dragOverSecId !== sectionId) setDragOverSecId(sectionId);
+    },
+    onDragLeave: (e: React.DragEvent<HTMLElement>) => {
+      if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+      if (dragOverSecId === sectionId) setDragOverSecId(null);
+    },
+    onDrop: (e: React.DragEvent<HTMLElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const from = draggedSecRef.current || e.dataTransfer.getData('text/plain');
+      if (onReorderSectionsDirect && from && from !== sectionId) {
+        onReorderSectionsDirect(from, sectionId, targetColumn);
+      }
+      clearSectionDrag();
+    },
+    onDragEnd: () => clearSectionDrag(),
+  });
+
 
   // Render Portrait Avatar with Crop / Zoom / Offset / Background color support
   const renderAvatar = (defaultWidthPx = 106, defaultHeightPx = 142, extraClass = '') => {
@@ -290,6 +501,20 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           width: `${widthPx}px`,
           height: `${heightPx}px`,
           backgroundColor: bgColor,
+        }}
+        role="button"
+        tabIndex={0}
+        aria-label="点击修改或更换证件照"
+        title="点击修改证件照，在左侧调整照片及裁剪"
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelectSection?.('basics');
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onSelectSection?.('basics');
+          }
         }}
         className={`${extraClass} shrink-0 overflow-hidden flex items-center justify-center relative`}
       >
@@ -409,7 +634,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     return (
       <div
         onClick={(e) => e.stopPropagation()}
-        className="no-print opacity-0 group-hover/sec:opacity-100 transition-all duration-150 absolute -top-3.5 right-1 z-20 flex items-center gap-0.5 bg-slate-900/90 backdrop-blur-xl text-white px-2 py-0.5 rounded-full shadow-lg ring-1 ring-white/15 text-[10px]"
+        className="no-print pointer-events-none opacity-0 group-hover/sec:opacity-100 transition-all duration-150 absolute -top-3.5 right-1 z-20 flex items-center gap-0.5 bg-slate-900/90 backdrop-blur-xl text-white px-2 py-0.5 rounded-full shadow-lg ring-1 ring-white/15 text-[10px]"
       >
         <span className="cursor-grab px-1 text-slate-300 flex items-center gap-0.5" title="在纸张上直接拖拽移动此模块">
           <GripVertical className="w-3 h-3" />
@@ -419,7 +644,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           type="button"
           disabled={idxInList === 0}
           onClick={() => onMoveSectionInView(sec.id, -1, isTwoColumn)}
-          className="px-1 py-0.5 hover:bg-white/15 disabled:opacity-30 rounded-full flex items-center cursor-pointer"
+          className="pointer-events-auto px-1 py-0.5 hover:bg-white/15 disabled:opacity-30 rounded-full flex items-center cursor-pointer"
           title="上移模块"
         >
           <ArrowUp className="w-3 h-3" />
@@ -428,7 +653,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           type="button"
           disabled={idxInList === listLength - 1}
           onClick={() => onMoveSectionInView(sec.id, 1, isTwoColumn)}
-          className="px-1 py-0.5 hover:bg-white/15 disabled:opacity-30 rounded-full flex items-center cursor-pointer"
+          className="pointer-events-auto px-1 py-0.5 hover:bg-white/15 disabled:opacity-30 rounded-full flex items-center cursor-pointer"
           title="下移模块"
         >
           <ArrowDown className="w-3 h-3" />
@@ -437,7 +662,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           <button
             type="button"
             onClick={() => onToggleSectionColumn(sec.id)}
-            className="px-2 py-0.5 bg-[#0071e3] hover:bg-[#0077ed] rounded-full flex items-center gap-0.5 ml-0.5 font-medium cursor-pointer"
+            className="pointer-events-auto px-2 py-0.5 bg-[#0071e3] hover:bg-[#0077ed] rounded-full flex items-center gap-0.5 ml-0.5 font-medium cursor-pointer"
             title={col === 'left' ? '将此模块移至右侧主栏' : '将此模块移至左侧灰栏'}
           >
             <ArrowLeftRight className="w-2.5 h-2.5" />
@@ -461,7 +686,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
               value={basics.summary}
               multiline
               richRender
-              placeholder="请在左侧编辑器中填写个人简介，或直接双击此处修改..."
+              placeholder="点击此处填写个人简介，也可以在左侧编辑器中修改..."
               onSave={
                 onInlineUpdateResume
                   ? (val) =>
@@ -516,21 +741,21 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                           : undefined
                       }
                     />
-                    {edu.degree && !edu.major.includes(edu.degree) ? `（${edu.degree}）` : ''}
+                    {edu.degree && !edu.major.includes(edu.degree) && <>（{editItem('education', edu.id, 'degree', edu.degree)}）</>}
                   </div>
                   <div className="text-[#333333] mb-[5px]">
-                    {edu.startDate} - {edu.endDate}
+                    {editItem('education', edu.id, 'startDate', edu.startDate)} - {editItem('education', edu.id, 'endDate', edu.endDate)}
                   </div>
 
                   <div className="space-y-[3px] text-[#3a3a3a]">
                     {edu.gpa && (
                       <div>
-                        · GPA {edu.gpa}
-                        {edu.ranking && !edu.gpa.includes(edu.ranking) ? `（${edu.ranking}）` : ''}
+                        · GPA {editItem('education', edu.id, 'gpa', edu.gpa)}
+                        {edu.ranking && !edu.gpa.includes(edu.ranking) && <>（{editItem('education', edu.id, 'ranking', edu.ranking)}）</>}
                       </div>
                     )}
-                    {edu.honors && <div>· {renderRichText(edu.honors)}</div>}
-                    {edu.courses && <div>· 核心课程：{renderRichText(edu.courses)}</div>}
+                    {edu.honors && <div>· {editItem('education', edu.id, 'honors', edu.honors, { richRender: true })}</div>}
+                    {edu.courses && <div>· 核心课程：{editItem('education', edu.id, 'courses', edu.courses, { richRender: true })}</div>}
                   </div>
                 </div>
               ))}
@@ -543,9 +768,9 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
               <div key={edu.id} className="group/item relative text-[0.97em]">
                 <div className="flex items-baseline justify-between gap-3">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-bold text-[#222222] text-[1.06em]">{edu.school}</span>
+                    <span className="font-bold text-[#222222] text-[1.06em]">{editItem('education', edu.id, 'school', edu.school)}</span>
                     <span className="text-[#888888]">·</span>
-                    <span className="text-[#444444]">{edu.major}</span>
+                    <span className="text-[#444444]">{editItem('education', edu.id, 'major', edu.major)}</span>
                     {renderItemAIButton({
                       sectionId: sec.id,
                       sectionType: 'education',
@@ -554,16 +779,16 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   <span className="text-[#444444] shrink-0">
-                    {edu.startDate} - {edu.endDate}
+                    {editItem('education', edu.id, 'startDate', edu.startDate)} - {editItem('education', edu.id, 'endDate', edu.endDate)}
                   </span>
                 </div>
                 <div className="text-[#3a3a3a] mt-0.5 space-y-0.5">
                   {edu.gpa && (
                     <div>
-                      · GPA {edu.gpa} {edu.honors ? ` | ${edu.honors}` : ''}
+                      · GPA {editItem('education', edu.id, 'gpa', edu.gpa)} {edu.honors ? ` | ${edu.honors}` : ''}
                     </div>
                   )}
-                  {edu.courses && <div>· 核心课程：{renderRichText(edu.courses)}</div>}
+                  {edu.courses && <div>· 核心课程：{editItem('education', edu.id, 'courses', edu.courses, { richRender: true })}</div>}
                 </div>
               </div>
             ))}
@@ -645,11 +870,11 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                           : undefined
                       }
                     />
-                    {aw.level ? `（${aw.level}）` : ''}
+                    {aw.level && <>（{editItem('awards', aw.id, 'level', aw.level)}）</>}
                   </span>
                   <div className="flex items-center gap-1.5 shrink-0">
                     {!inLeftSidebar && aw.date && (
-                      <span className="text-[#555555] text-[0.92em]">{aw.date}</span>
+                      <span className="text-[#555555] text-[0.92em]">{editItem('awards', aw.id, 'date', aw.date)}</span>
                     )}
                     {renderItemAIButton({
                       sectionId: sec.id,
@@ -660,7 +885,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                   </div>
                 </div>
                 {aw.description && (
-                  <div className="text-[#555555] pl-2.5 text-[0.92em] mt-0.5">{renderRichText(aw.description)}</div>
+                  <div className="text-[#555555] pl-2.5 text-[0.92em] mt-0.5">{editItem('awards', aw.id, 'description', aw.description, {multiline:true,richRender:true})}</div>
                 )}
               </div>
             ))}
@@ -669,9 +894,9 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
       case 'projects':
         return (
-          <div className="space-y-[13px]">
+          <div data-cv-items className="space-y-[13px]">
             {projects.map((proj) => (
-              <div key={proj.id} className="group/item relative">
+              <div data-cv-item key={proj.id} className="group/item relative">
                 <div className="flex items-baseline justify-between gap-2 mb-[2.5px]">
                   <div className="flex items-center gap-2 min-w-0 flex-wrap">
                     <h3 className="font-bold text-[#222222] text-[1.1em] leading-snug">
@@ -718,21 +943,21 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
                 <div className="text-[0.97em] flex flex-wrap items-center mb-[4px]">
                   <span className="font-bold text-[#222222]">
-                    {proj.startDate} - {proj.endDate}
+                    {editItem('projects', proj.id, 'startDate', proj.startDate)} - {editItem('projects', proj.id, 'endDate', proj.endDate)}
                   </span>
                   {proj.techStack.length > 0 && (
                     <>
                       <span className="mx-[8px] text-[#b0b0b0]">|</span>
-                      <span className="text-[#555555]">{proj.techStack.join(' / ')}</span>
+                      <span className="text-[#555555]">{editItem('projects', proj.id, 'techStack', proj.techStack.join(' / '), { asList: true })}</span>
                     </>
                   )}
                 </div>
 
                 {proj.summary && (
-                  <p className="text-[0.97em] text-[#333333] mb-[3px]">{renderRichText(proj.summary)}</p>
+                  <p className="text-[0.97em] text-[#333333] mb-[3px]">{editItem('projects', proj.id, 'summary', proj.summary, { multiline: true, richRender: true })}</p>
                 )}
 
-                <ul className="space-y-[3px] text-[0.97em] text-[#333333]">
+                <ul data-cv-bullets className="space-y-[3px] text-[0.97em] text-[#333333]">
                   {proj.bullets.filter(Boolean).map((bullet, idx) => (
                     <li key={idx} className="flex items-start gap-[7px]">
                       <span className="text-[#333333] shrink-0 select-none">•</span>
@@ -750,7 +975,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                                       x.id === proj.id
                                         ? {
                                             ...x,
-                                            bullets: x.bullets.map((b, bIdx) => (bIdx === idx ? val : b)),
+                                            bullets: x.bullets.map((b, bIdx) => (bIdx === visibleBulletIndex(x.bullets, idx) ? val : b)),
                                           }
                                         : x
                                     ),
@@ -769,11 +994,11 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
       case 'experience':
         return (
-          <div className="space-y-[11px]">
+          <div data-cv-items className="space-y-[11px]">
             {experience.map((exp) => {
               const cleanBullets = exp.bullets.filter(Boolean);
               return (
-                <div key={exp.id} className="group/item relative">
+                <div data-cv-item key={exp.id} className="group/item relative">
                   <div className="flex items-center justify-between gap-2 mb-[2px]">
                     <div className="flex flex-wrap items-baseline gap-x-[6px]">
                       <span className="font-bold text-[#222222] text-[1.05em]">
@@ -799,8 +1024,8 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                             className="text-[1em]"
                             style={{ color: useColor ? style.accentColor : '#555555' }}
                           >
-                            {exp.position}
-                            {exp.department ? `（${exp.department}）` : ''}
+                            {editItem('experience', exp.id, 'position', exp.position)}
+                            {exp.department && <>（{editItem('experience', exp.id, 'department', exp.department)}）</>}
                           </span>
                         </>
                       )}
@@ -813,7 +1038,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   <div className="text-[0.97em] text-[#444444] mb-[3.5px]">
-                    {exp.startDate} - {exp.endDate}
+                    {editItem('experience', exp.id, 'startDate', exp.startDate)} - {editItem('experience', exp.id, 'endDate', exp.endDate)}
                   </div>
                   {cleanBullets.length === 1 ? (
                     <p className="text-[0.97em] text-[#333333]">
@@ -827,7 +1052,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                                 onInlineUpdateResume((prev) => ({
                                   ...prev,
                                   experience: prev.experience.map((x) =>
-                                    x.id === exp.id ? { ...x, bullets: [val] } : x
+                                    x.id === exp.id ? { ...x, bullets: x.bullets.map((b, i) => i === visibleBulletIndex(x.bullets, 0) ? val : b) } : x
                                   ),
                                 }))
                             : undefined
@@ -835,7 +1060,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                       />
                     </p>
                   ) : (
-                    <ul className="space-y-[3px] text-[0.97em] text-[#333333]">
+                    <ul data-cv-bullets className="space-y-[3px] text-[0.97em] text-[#333333]">
                       {cleanBullets.map((bullet, idx) => (
                         <li key={idx} className="flex items-start gap-[7px]">
                           <span className="text-[#333333] shrink-0 select-none">•</span>
@@ -853,7 +1078,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                                           x.id === exp.id
                                             ? {
                                                 ...x,
-                                                bullets: x.bullets.map((b, bIdx) => (bIdx === idx ? val : b)),
+                                                bullets: x.bullets.map((b, bIdx) => (bIdx === visibleBulletIndex(x.bullets, idx) ? val : b)),
                                               }
                                             : x
                                         ),
@@ -872,16 +1097,16 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           </div>
         );
 
-      case 'custom':
+      case 'custom': {
+        const customSec = customSections.find((c) => c.id === sec.customSectionId);
+        if (!customSec) return null;
         return (
           <div className="space-y-[10px]">
-            {customSections
-              .find((c) => c.id === sec.customSectionId)
-              ?.items.map((item) => (
+            {customSec.items.map((item) => (
                 <div key={item.id} className="group/item relative space-y-1">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-bold text-[#222222] text-[1.04em]">{item.heading}</span>
+                      <span className="font-bold text-[#222222] text-[1.04em]">{editCustomField(customSec.id, item.id, 'heading', item.heading)}</span>
                       {renderItemAIButton({
                         sectionId: sec.id,
                         sectionType: 'custom',
@@ -890,18 +1115,19 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                         itemId: item.id,
                       })}
                     </div>
-                    {item.date && <span className="text-[0.95em] text-[#555555] shrink-0">{item.date}</span>}
+                    {item.date && <span className="text-[0.95em] text-[#555555] shrink-0">{editCustomField(customSec.id, item.id, 'date', item.date)}</span>}
                   </div>
-                  {item.subheading && <div className="text-[0.95em] text-[#555555]">{item.subheading}</div>}
+                  {item.subheading && <div className="text-[0.95em] text-[#555555]">{editCustomField(customSec.id, item.id, 'subheading', item.subheading)}</div>}
                   {item.bullets.filter(Boolean).map((b, i) => (
                     <p key={i} className="text-[0.97em] text-[#333333]">
-                      {renderRichText(b)}
+                      {editCustomBullet(customSec.id, item.id, i, b)}
                     </p>
                   ))}
                 </div>
               ))}
           </div>
         );
+      }
 
       default:
         return null;
@@ -930,7 +1156,6 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     const avatarInRight = basics.avatarPosition === 'right';
     const leftWidthPercent = style.leftColumnWidth ?? 31.5;
     const rightWidthPercent = 100 - leftWidthPercent;
-    const secGapPx = style.sectionSpacing ?? 15;
     const useColor = Boolean(style.useThemeColorInPdf && style.accentColor);
     const headerTitleColor = useColor ? style.accentColor : '#222222';
     const slantBarColor = useColor ? style.accentColor : style.accentColor || '#666666';
@@ -938,7 +1163,9 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     return (
       <div
         ref={sheetRef}
-        id="a4-resume-sheet"
+        id={previewId}
+        {...rhythmAttributes}
+        style={rhythmVars as React.CSSProperties}
         className={`w-[210mm] min-h-[297mm] bg-white text-[#333333] shadow-sm border border-slate-200 relative ${outerPagePad} flex items-stretch ${fontSizeClass} ${lineHeightClass}`}
       >
         {/* LEFT GRAY COLUMN (matches exact PDF #F5F5F5 panel inside outer page margin) */}
@@ -952,7 +1179,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           }}
           style={{
             width: `${leftWidthPercent}%`,
-            gap: `${secGapPx}px`,
+            gap: 0,
           }}
           className="shrink-0 bg-[#f5f5f5] px-[15px] py-[14px] flex flex-col"
         >
@@ -987,6 +1214,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
             return (
               <section
                 key={sec.id}
+                style={{ marginTop: idx === 0 && !(basics.showAvatar && !avatarInRight) && sec.spacingBeforePx === undefined ? 0 : sectionGapPx(style, sec) }}
                 draggable
                 onDragStart={() => setDraggedSecId(sec.id)}
                 onDragOver={(e) => {
@@ -1017,6 +1245,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
                 {/* Left Section Header: Bold Chinese + Uppercase English */}
                 <div
+                  data-cv-section-heading
                   className="border-b pb-[5px] mb-[10px] flex items-center gap-[6px]"
                   style={{ borderColor: useColor ? `${style.accentColor}40` : '#d6d6d6' }}
                 >
@@ -1025,8 +1254,8 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                       className="text-[1.28em] font-bold tracking-tight leading-none"
                       style={{ color: headerTitleColor }}
                     >
-                      {sec.title}
-                    </h2>
+                    {editSectionTitle(sec)}
+                  </h2>
                     {enTitle && (
                       <span className="text-[0.87em] font-normal text-[#666666] uppercase tracking-normal leading-none truncate">
                         {enTitle}
@@ -1036,7 +1265,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                   {renderSectionAIButton(sec)}
                 </div>
 
-                {renderPdfClassicSectionContent(sec, true)}
+                <div data-cv-section-body>{renderPdfClassicSectionContent(sec, true)}</div>
               </section>
             );
           })}
@@ -1053,7 +1282,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           }}
           style={{
             width: `${rightWidthPercent}%`,
-            gap: `${secGapPx}px`,
+            gap: 0,
           }}
           className="bg-white pl-[24px] pr-[4px] py-[6px] flex flex-col"
         >
@@ -1061,7 +1290,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           <header
             onClick={() => onSelectSection?.('basics')}
             className="group/avatar relative cursor-pointer flex items-start justify-between gap-[16px] pb-[4px] hover:bg-slate-50/70 rounded transition-colors"
-            title="单击定位左侧面板，双击文字可直接修改"
+            title="点击文字直接修改；点击空白处在左侧面板中编辑"
           >
             {/* Left Name & Role Block */}
             <div className="w-[44%] shrink-0 pt-[2px]">
@@ -1231,6 +1460,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
             return (
               <section
                 key={sec.id}
+                style={{ marginTop: sectionGapPx(style, sec) }}
                 draggable
                 onDragStart={() => setDraggedSecId(sec.id)}
                 onDragOver={(e) => {
@@ -1261,6 +1491,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
                 {/* Right Column Section Header: Slanted Parallelogram + Chinese Title + English Subtitle */}
                 <div
+                  data-cv-section-heading
                   className="border-b pb-[5px] mb-[10px] flex items-center justify-between gap-2"
                   style={{ borderColor: useColor ? `${style.accentColor}40` : '#d6d6d6' }}
                 >
@@ -1273,8 +1504,8 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                       className="text-[1.28em] font-bold tracking-tight leading-none"
                       style={{ color: headerTitleColor }}
                     >
-                      {sec.title}
-                    </h2>
+                    {editSectionTitle(sec)}
+                  </h2>
                     {enTitle && (
                       <span className="text-[0.87em] font-normal text-[#666666] uppercase tracking-normal ml-[8px] leading-none truncate">
                         {enTitle}
@@ -1284,7 +1515,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                   {renderSectionAIButton(sec)}
                 </div>
 
-                {renderPdfClassicSectionContent(sec, false)}
+                <div data-cv-section-body>{renderPdfClassicSectionContent(sec, false)}</div>
               </section>
             );
           })}
@@ -1322,16 +1553,16 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         return (
           <div className="space-y-2.5">
             {education.map((edu) => (
-              <div key={edu.id} className="space-y-1">
+              <div key={edu.id} className="space-y-1 ats-print-entry">
                 <div className="flex items-baseline justify-between gap-4">
                   <div className="flex flex-wrap items-center gap-x-2">
-                    <span className="font-bold text-slate-900 text-[1.06em]">{edu.school}</span>
+                    <span className="font-bold text-slate-900 text-[1.06em]">{editItem('education', edu.id, 'school', edu.school)}</span>
                     <span className="text-slate-400">·</span>
-                    <span className="font-semibold text-slate-800">{edu.major}</span>
+                    <span className="font-semibold text-slate-800">{editItem('education', edu.id, 'major', edu.major)}</span>
                     {edu.degree && !edu.major.includes(edu.degree) && (
                       <>
                         <span className="text-slate-400">·</span>
-                        <span className="text-slate-600 text-[0.94em]">{edu.degree}</span>
+                        <span className="text-slate-600 text-[0.94em]">{editItem('education', edu.id, 'degree', edu.degree)}</span>
                       </>
                     )}
                     {renderItemAIButton({
@@ -1342,7 +1573,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   <span className="font-mono tabular-nums text-[0.92em] text-slate-600 shrink-0">
-                    {edu.startDate} – {edu.endDate}
+                    {editItem('education', edu.id, 'startDate', edu.startDate)} – {editItem('education', edu.id, 'endDate', edu.endDate)}
                   </span>
                 </div>
                 {(edu.gpa || edu.ranking || edu.honors) && (
@@ -1350,20 +1581,20 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     {edu.gpa && (
                       <span>
                         <strong className="font-semibold text-slate-800">GPA:</strong>{' '}
-                        <span className="font-mono tabular-nums">{edu.gpa}</span>
+                        <span className="font-mono tabular-nums">{editItem('education', edu.id, 'gpa', edu.gpa)}</span>
                       </span>
                     )}
                     {edu.gpa && edu.ranking && <span className="text-slate-300">|</span>}
                     {edu.ranking && (
                       <span>
                         <strong className="font-semibold text-slate-800">专业排名:</strong>{' '}
-                        <span className="font-mono tabular-nums">{edu.ranking}</span>
+                        <span className="font-mono tabular-nums">{editItem('education', edu.id, 'ranking', edu.ranking)}</span>
                       </span>
                     )}
                     {(edu.gpa || edu.ranking) && edu.honors && <span className="text-slate-300">|</span>}
                     {edu.honors && (
                       <span>
-                        <strong className="font-semibold text-slate-800">荣誉:</strong> {renderRichText(edu.honors)}
+                        <strong className="font-semibold text-slate-800">荣誉:</strong> {editItem('education', edu.id, 'honors', edu.honors, {richRender:true})}
                       </span>
                     )}
                   </div>
@@ -1371,7 +1602,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                 {edu.courses && (
                   <p className="text-[0.93em] text-slate-600">
                     <strong className="font-semibold text-slate-800">核心课程：</strong>
-                    {renderRichText(edu.courses)}
+                    {editItem('education', edu.id, 'courses', edu.courses, {richRender:true})}
                   </p>
                 )}
               </div>
@@ -1381,9 +1612,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
       case 'projects':
         return (
-          <div className={isClassicATS ? 'space-y-3' : 'space-y-3.5'}>
+          <div data-cv-items className={isClassicATS ? 'space-y-3' : 'space-y-3.5'}>
             {projects.map((proj) => (
-              <div key={proj.id} className="space-y-1">
+              <div data-cv-item key={proj.id} className={'space-y-1 ats-print-entry ats-print-project-entry' +
+                (isLongAtsProject(proj) ? ' ats-print-project-breakable' : '')}>
                 <div className="flex items-baseline justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-x-2">
                     <span className="font-bold text-slate-900 text-[1.05em]">
@@ -1407,7 +1639,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                           className="font-semibold text-[0.94em]"
                           style={{ color: isClassicATS ? '#1e293b' : style.accentColor }}
                         >
-                          {proj.role}
+                          {editItem('projects', proj.id, 'role', proj.role)}
                         </span>
                       </>
                     )}
@@ -1419,7 +1651,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   <span className="font-mono tabular-nums text-[0.92em] text-slate-600 shrink-0">
-                    {proj.startDate} – {proj.endDate}
+                    {editItem('projects', proj.id, 'startDate', proj.startDate)} – {editItem('projects', proj.id, 'endDate', proj.endDate)}
                   </span>
                 </div>
 
@@ -1428,26 +1660,29 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     {proj.techStack.length > 0 && (
                       <div className="font-mono text-slate-700">
                         <span className="font-sans font-semibold text-slate-800">技术栈：</span>
-                        {proj.techStack.join(' / ')}
+                        {editItem('projects', proj.id, 'techStack', proj.techStack.join(' / '), {asList:true})}
                       </div>
                     )}
                     {proj.repoUrl && (
-                      <a
-                        href={proj.repoUrl.startsWith('http') ? proj.repoUrl : `https://${proj.repoUrl}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="font-mono text-[0.92em] underline decoration-slate-300 hover:decoration-slate-600 text-slate-600 truncate max-w-[280px]"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {proj.repoUrl.replace(/^https?:\/\//, '')}
-                      </a>
+                      <span data-ats-project-repo className="font-mono text-[0.92em] text-slate-600 break-all max-w-[280px] inline-flex items-center gap-1.5">
+                        {editItem('projects', proj.id, 'repoUrl', proj.repoUrl)}
+                        <a
+                          href={proj.repoUrl.startsWith('http') ? proj.repoUrl : `https://${proj.repoUrl}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label="在浏览器打开项目仓库"
+                          title="在浏览器打开项目仓库"
+                          className="no-print text-blue-600 hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >↗</a>
+                      </span>
                     )}
                   </div>
                 )}
 
-                {proj.summary && <p className="text-[0.94em] text-slate-700 italic">{renderRichText(proj.summary)}</p>}
+                {proj.summary && <p className="text-[0.94em] text-slate-700 italic">{editItem('projects', proj.id, 'summary', proj.summary, {multiline:true, richRender:true})}</p>}
 
-                <ul className="list-disc pl-4 space-y-0.5 text-slate-800">
+                <ul data-cv-bullets className="list-disc pl-4 space-y-0.5 text-slate-800">
                   {proj.bullets.filter(Boolean).map((bullet, idx) => (
                     <li key={idx} className="text-[0.95em] marker:text-slate-400">
                       <InlineEditableText
@@ -1463,7 +1698,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                                     x.id === proj.id
                                       ? {
                                           ...x,
-                                          bullets: x.bullets.map((b, bIdx) => (bIdx === idx ? val : b)),
+                                          bullets: x.bullets.map((b, bIdx) => (bIdx === visibleBulletIndex(x.bullets, idx) ? val : b)),
                                         }
                                       : x
                                   ),
@@ -1481,23 +1716,23 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
 
       case 'experience':
         return (
-          <div className="space-y-3">
+          <div data-cv-items className="space-y-3">
             {experience.map((exp) => (
-              <div key={exp.id} className="space-y-1">
+              <div data-cv-item key={exp.id} className="space-y-1 ats-print-entry">
                 <div className="flex items-baseline justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-x-2">
-                    <span className="font-bold text-slate-900 text-[1.05em]">{exp.company}</span>
+                    <span className="font-bold text-slate-900 text-[1.05em]">{editItem('experience', exp.id, 'company', exp.company)}</span>
                     <span className="text-slate-400">·</span>
                     <span
                       className="font-semibold text-[0.96em]"
                       style={{ color: isClassicATS ? '#0f172a' : style.accentColor }}
                     >
-                      {exp.position}
+                      {editItem('experience', exp.id, 'position', exp.position)}
                     </span>
                     {exp.department && (
                       <>
                         <span className="text-slate-400">·</span>
-                        <span className="text-slate-600 text-[0.92em]">{exp.department}</span>
+                        <span className="text-slate-600 text-[0.92em]">{editItem('experience', exp.id, 'department', exp.department)}</span>
                       </>
                     )}
                     {renderItemAIButton({
@@ -1508,20 +1743,20 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   <span className="font-mono tabular-nums text-[0.92em] text-slate-600 shrink-0">
-                    {exp.location ? `${exp.location} · ` : ''}
-                    {exp.startDate} – {exp.endDate}
+                    {exp.location && <>{editItem('experience', exp.id, 'location', exp.location)} · </>}
+                    {editItem('experience', exp.id, 'startDate', exp.startDate)} – {editItem('experience', exp.id, 'endDate', exp.endDate)}
                   </span>
                 </div>
                 {exp.techStack.length > 0 && (
                   <div className="text-[0.9em] font-mono text-slate-600">
                     <span className="font-sans font-semibold text-slate-800">涉及技术：</span>
-                    {exp.techStack.join(' · ')}
+                    {editItem('experience', exp.id, 'techStack', exp.techStack.join(' · '), {asList:true})}
                   </div>
                 )}
-                <ul className="list-disc pl-4 space-y-0.5 text-slate-800">
+                <ul data-cv-bullets className="list-disc pl-4 space-y-0.5 text-slate-800">
                   {exp.bullets.filter(Boolean).map((bullet, idx) => (
                     <li key={idx} className="text-[0.95em] marker:text-slate-400">
-                      {renderRichText(bullet)}
+                      {editBullet('experience', exp.id, idx, bullet)}
                     </li>
                   ))}
                 </ul>
@@ -1536,8 +1771,8 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
             {skills.map((sk) => (
               <div key={sk.id} className="text-[0.95em] text-slate-800 flex items-start justify-between gap-2">
                 <div>
-                  <span className="font-bold text-slate-900">{sk.category}：</span>
-                  <span>{renderRichText(sk.items)}</span>
+                  <span className="font-bold text-slate-900">{editItem('skills', sk.id, 'category', sk.category)}：</span>
+                  <span>{editItem('skills', sk.id, 'items', sk.items, {multiline:true, richRender:true})}</span>
                 </div>
                 {renderItemAIButton({
                   sectionId: sec.id,
@@ -1554,10 +1789,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         return (
           <div className="space-y-1.5">
             {awards.map((aw) => (
-              <div key={aw.id} className="text-[0.95em]">
+              <div key={aw.id} className="text-[0.95em] ats-print-entry">
                 <div className="flex items-baseline justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-x-2">
-                    <span className="font-bold text-slate-900">{renderRichText(aw.title)}</span>
+                    <span className="font-bold text-slate-900">{editItem('awards', aw.id, 'title', aw.title, {richRender:true})}</span>
                     {aw.level && (
                       <>
                         <span className="text-slate-400">·</span>
@@ -1565,14 +1800,14 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                           className="font-semibold"
                           style={{ color: isClassicATS ? '#0f172a' : style.accentColor }}
                         >
-                          {aw.level}
+                          {editItem('awards', aw.id, 'level', aw.level)}
                         </span>
                       </>
                     )}
                     {aw.issuer && (
                       <>
                         <span className="text-slate-400">·</span>
-                        <span className="text-slate-600 text-[0.92em]">{aw.issuer}</span>
+                        <span className="text-slate-600 text-[0.92em]">{editItem('awards', aw.id, 'issuer', aw.issuer)}</span>
                       </>
                     )}
                     {renderItemAIButton({
@@ -1582,9 +1817,9 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                       itemId: aw.id,
                     })}
                   </div>
-                  <span className="font-mono tabular-nums text-[0.9em] text-slate-600 shrink-0">{aw.date}</span>
+                  <span className="font-mono tabular-nums text-[0.9em] text-slate-600 shrink-0">{editItem('awards', aw.id, 'date', aw.date)}</span>
                 </div>
-                {aw.description && <p className="text-[0.92em] text-slate-600 mt-0.5">{renderRichText(aw.description)}</p>}
+                {aw.description && <p className="text-[0.92em] text-slate-600 mt-0.5">{editItem('awards', aw.id, 'description', aw.description, {multiline:true,richRender:true})}</p>}
               </div>
             ))}
           </div>
@@ -1596,14 +1831,14 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         return (
           <div className="space-y-2">
             {customSec.items.map((item) => (
-              <div key={item.id} className="space-y-0.5">
+              <div key={item.id} className="space-y-0.5 ats-print-entry">
                 <div className="flex items-baseline justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-x-2">
-                    <span className="font-bold text-slate-900">{item.heading}</span>
+                    <span className="font-bold text-slate-900">{editCustomField(customSec.id, item.id, 'heading', item.heading)}</span>
                     {item.subheading && (
                       <>
                         <span className="text-slate-400">·</span>
-                        <span className="text-slate-600 text-[0.93em]">{item.subheading}</span>
+                        <span className="text-slate-600 text-[0.93em]">{editCustomField(customSec.id, item.id, 'subheading', item.subheading)}</span>
                       </>
                     )}
                     {renderItemAIButton({
@@ -1615,14 +1850,14 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     })}
                   </div>
                   {item.date && (
-                    <span className="font-mono tabular-nums text-[0.9em] text-slate-600 shrink-0">{item.date}</span>
+                    <span className="font-mono tabular-nums text-[0.9em] text-slate-600 shrink-0">{editCustomField(customSec.id, item.id, 'date', item.date)}</span>
                   )}
                 </div>
                 {item.bullets.filter(Boolean).length > 0 && (
                   <ul className="list-disc pl-4 space-y-0.5 text-slate-800">
                     {item.bullets.filter(Boolean).map((b, i) => (
                       <li key={i} className="text-[0.94em] marker:text-slate-400">
-                        {renderRichText(b)}
+                        {editCustomBullet(customSec.id, item.id, i, b)}
                       </li>
                     ))}
                   </ul>
@@ -1638,6 +1873,165 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     }
   };
 
+
+  // Reusable single-column native layouts inspired by public resume template projects.
+  // These are original React renderings, not imported LaTeX, Typst or third-party PDF code.
+  const referenceTemplate = TEMPLATE_CATALOG.find(
+    (candidate) => candidate.id === style.template && candidate.source !== 'CraftCV'
+  );
+  if (referenceTemplate) {
+    const id = referenceTemplate.id;
+    const isMeowth = id === 'reactive-meowth';
+    const isOnyx = id === 'reactive-onyx';
+    const isBronzor = id === 'reactive-bronzor';
+    const isHarvard = id === 'render-harvard';
+    const isEngineering = id === 'render-engineering';
+    const isEngineeringClassic = id === 'render-engineering-classic';
+    const isAwesome = id === 'awesome-inspired';
+    const isSample = id === 'resumesample-engineer';
+    const isCentered = isHarvard || isEngineering;
+    const accent = style.accentColor || referenceTemplate.accent;
+
+    const contactFields = ([
+      { field: 'phone', value: basics.phone },
+      { field: 'email', value: basics.email },
+      { field: 'github', value: basics.github },
+      { field: 'website', value: basics.website },
+      { field: 'location', value: basics.location },
+      { field: 'graduationYear', value: basics.graduationYear },
+    ] as Array<{ field: BasicTextField; value: string }>).filter((entry) => Boolean(entry.value));
+
+    const headingClass = isHarvard
+      ? 'text-[1.05em] font-bold tracking-[0.08em] uppercase'
+      : isAwesome
+        ? 'text-[1.09em] font-bold tracking-[0.04em]'
+        : isEngineering || isSample
+          ? 'text-[1.04em] font-extrabold tracking-[0.025em]'
+          : 'text-[1.05em] font-bold tracking-[0.045em]';
+
+    const headingColor = isHarvard || isEngineering
+      ? '#1f2937'
+      : accent;
+
+    return (
+      <div
+        ref={sheetRef}
+        id={previewId}
+        {...rhythmAttributes}
+        data-template-id={referenceTemplate.id}
+        className={'w-[210mm] min-h-[297mm] relative bg-white text-slate-900 shadow-sm border border-slate-200 ' +
+          paddingClass + ' ' + fontSizeClass + ' ' + lineHeightClass}
+        style={{
+          fontFamily: isHarvard
+            ? 'Georgia, Cambria, "Songti SC", "SimSun", serif'
+            : '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif',
+          ...rhythmVars,
+        }}
+      >
+        <header
+          onClick={() => onSelectSection?.('basics')}
+          className={'cursor-pointer group/sec flex gap-5 pb-3 ' +
+            (isCentered ? 'flex-col items-center text-center' : 'items-start justify-between') +
+            (isHarvard || isEngineering ? ' border-b-[1.5px] border-slate-800' : '')}
+          style={isAwesome ? { borderBottom: '2px solid ' + accent } : undefined}
+        >
+          <div className={'min-w-0 flex-1 ' + (isCentered ? 'w-full' : '')}>
+            <div className={'flex flex-wrap items-baseline gap-x-3 gap-y-1 ' + (isCentered ? 'justify-center' : '')}>
+              <h1
+                className={
+                  (isAwesome ? 'text-[29px] font-light tracking-[-0.025em] ' :
+                    isHarvard ? 'text-[27px] font-bold tracking-[0.015em] ' :
+                    isEngineering ? 'text-[24px] font-bold ' :
+                    isMeowth ? 'text-[26px] font-semibold ' :
+                    'text-[25px] font-bold tracking-tight ') +
+                  (isAwesome ? '' : 'text-slate-900')
+                }
+                style={isAwesome ? { color: accent } : undefined}
+              >
+                {editBasic('name')}
+              </h1>
+              {renderItemAIButton({
+                sectionId: 'basics',
+                sectionType: 'basics',
+                sectionTitle: '求职方向及个人信息',
+              })}
+            </div>
+            <div
+              className={'mt-0.5 text-[1.04em] ' +
+                (isEngineering || isSample ? 'font-bold' : 'font-medium')}
+              style={{ color: isHarvard || isEngineering ? '#334155' : accent }}
+            >
+              {editBasic('title')}
+              {basics.directionTags && <span className="font-normal text-slate-500"> · {editBasic('directionTags')}</span>}
+            </div>
+            <div
+              className={'mt-2 flex flex-wrap gap-x-2.5 gap-y-1 text-[0.87em] text-slate-600 ' +
+                (isCentered ? 'justify-center' : '')}
+            >
+              {contactFields.map((entry, i) => (
+                <React.Fragment key={entry.field}>
+                  {i > 0 && <span aria-hidden="true" className="text-slate-300">|</span>}
+                  <span className="break-all">{editBasic(entry.field)}</span>
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+          {!isCentered && referenceTemplate.portrait && (
+            renderAvatar(isMeowth ? 70 : 78, isMeowth ? 86 : 94, 'rounded-[2px] border border-slate-200')
+          )}
+        </header>
+
+        <div>
+          {visibleSections.map((sec, idx) => (
+            <section
+              key={sec.id}
+              {...getSectionDragProps(sec.id)}
+              onClick={() => onSelectSection?.(sec.type === 'summary' ? 'basics' : sec.id)}
+              className={'group/sec relative cursor-pointer hover:bg-slate-50/50 -mx-1.5 px-1.5 py-[1px] transition-colors ' +
+                (isBronzor ? 'grid grid-cols-[88px_minmax(0,1fr)] gap-x-4 ' : '') +
+                (dragOverSecId === sec.id ? 'ring-2 ring-blue-500 bg-blue-50/40 ' : '')}
+              style={{ breakInside: 'avoid', marginTop: sectionGapPx(style, sec) }}
+            >
+              {renderOnCanvasControls(sec, idx, visibleSections.length, false)}
+              <div
+                data-cv-section-heading
+                className={
+                  (isBronzor ? 'self-start pt-0.5 ' : 'mb-2 ') +
+                  (isOnyx ? 'border-l-[3px] pl-2 ' : '') +
+                  (isHarvard ? 'border-b-[1.5px] border-slate-800 pb-0.5 ' : '') +
+                  (isEngineering || isSample ? 'border-b border-slate-700 pb-[1px] ' : '') +
+                  (isMeowth || isEngineeringClassic ? 'border-b pb-[3px] ' : '')
+                }
+                style={
+                  isMeowth || isEngineeringClassic
+                    ? { borderColor: accent + '95' }
+                    : isOnyx
+                      ? { borderColor: accent }
+                      : undefined
+                }
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <h2 className={headingClass} style={{ color: headingColor }}>
+                    {editSectionTitle(sec)}
+                  </h2>
+                  {renderSectionAIButton(sec)}
+                </div>
+                {(isMeowth || isAwesome) && sec.englishTitle && (
+                  <div className="text-[0.72em] tracking-[0.07em] text-slate-400 mt-0.5">{editSectionEnglishTitle(sec)}</div>
+                )}
+              </div>
+              <div data-cv-section-body className={'min-w-0 ' + (isHarvard ? 'font-sans' : '')}>
+                {renderSectionBody(sec, false)}
+              </div>
+            </section>
+          ))}
+        </div>
+
+        {renderPageBreakGuide()}
+      </div>
+    );
+  }
+
   // ============================================================================
   // TEMPLATE 3: CREATIVE EDITORIAL SPLIT (创意设计感双栏风)
   // ============================================================================
@@ -1648,14 +2042,16 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     return (
       <div
         ref={sheetRef}
-        id="a4-resume-sheet"
+        id={previewId}
+        {...rhythmAttributes}
+        style={rhythmVars as React.CSSProperties}
         className={`w-[210mm] min-h-[297mm] bg-white text-slate-900 shadow-sm border border-slate-200 relative grid grid-cols-12 ${fontSizeClass} ${lineHeightClass}`}
       >
         <aside
           className="col-span-4 px-6 py-8 border-r border-slate-200 flex flex-col justify-between"
           style={{ backgroundColor: '#f8fafc' }}
         >
-          <div className="space-y-6">
+          <div>
             <div
               onClick={() => onSelectSection?.('basics')}
               className="cursor-pointer group space-y-3"
@@ -1664,7 +2060,7 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
               {basics.showAvatar && <div className="mb-3">{renderAvatar(96, 120, 'rounded border border-slate-200')}</div>}
               <div>
                 <div className="flex items-center justify-between gap-2">
-                  <h1 className="text-2xl font-bold tracking-tight text-slate-900">{basics.name}</h1>
+                  <h1 className="text-2xl font-bold tracking-tight text-slate-900">{editBasic('name')}</h1>
                   {renderItemAIButton(
                     {
                       sectionId: 'basics',
@@ -1674,11 +2070,9 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     'AI优化'
                   )}
                 </div>
-                <p className="font-semibold text-[0.98em] mt-1" style={{ color: style.accentColor }}>
-                  {basics.title}
-                </p>
+                <p className="font-semibold text-[0.98em] mt-1" style={{ color: style.accentColor }}>{editBasic('title')}</p>
                 {basics.directionTags && (
-                  <p className="text-[0.88em] text-slate-500 mt-1">{basics.directionTags}</p>
+                  <p className="text-[0.88em] text-slate-500 mt-1">{editBasic('directionTags')}</p>
                 )}
               </div>
 
@@ -1686,19 +2080,19 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                 {basics.phone && (
                   <div className="flex items-baseline justify-between gap-2">
                     <span className="text-slate-500">电话</span>
-                    <span className="font-mono tabular-nums text-slate-800">{basics.phone}</span>
+                    <span className="font-mono tabular-nums text-slate-800">{editBasic('phone')}</span>
                   </div>
                 )}
                 {basics.email && (
                   <div className="flex flex-col">
                     <span className="text-slate-500 text-[0.9em]">邮箱</span>
-                    <span className="font-mono text-slate-800 break-all">{basics.email}</span>
+                    <span className="font-mono text-slate-800 break-all">{editBasic('email')}</span>
                   </div>
                 )}
                 {basics.github && (
                   <div className="flex flex-col">
                     <span className="text-slate-500 text-[0.9em]">GitHub</span>
-                    <span className="font-mono text-slate-800 break-all">{basics.github}</span>
+                    <span className="font-mono text-slate-800 break-all">{editBasic('github')}</span>
                   </div>
                 )}
               </div>
@@ -1707,11 +2101,15 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
             {sidebarSections.map((sec, idx) => (
               <section
                 key={sec.id}
+                style={{ marginTop: sectionGapPx(style, sec) }}
+                {...getSectionDragProps(sec.id, 'left')}
                 onClick={() => onSelectSection?.(sec.type === 'summary' ? 'basics' : sec.id)}
-                className="group/sec relative cursor-pointer space-y-2.5 pt-4 border-t border-slate-200/90 hover:bg-slate-100/60 -mx-2 px-2 py-1 rounded transition-colors"
+                className={'group/sec relative cursor-pointer space-y-2.5 pt-4 border-t border-slate-200/90 hover:bg-slate-100/60 -mx-2 px-2 py-1 rounded transition-colors ' +
+                  (dragOverSecId === sec.id ? 'ring-2 ring-blue-500 bg-blue-50/40' : '')}
               >
                 {renderOnCanvasControls(sec, idx, sidebarSections.length, true)}
                 <div
+                  data-cv-section-heading
                   className="pb-1 border-b flex items-center justify-between gap-2"
                   style={{ borderColor: `${style.accentColor}33` }}
                 >
@@ -1719,34 +2117,37 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                     className="text-[1.04em] font-bold tracking-tight"
                     style={{ color: style.accentColor }}
                   >
-                    {sec.title}
+                    {editSectionTitle(sec)}
                   </h2>
                   {renderSectionAIButton(sec)}
                 </div>
-                {renderSectionBody(sec, false)}
+                <div data-cv-section-body>{renderSectionBody(sec, false)}</div>
               </section>
             ))}
           </div>
         </aside>
 
-        <main className="col-span-8 px-7 py-8 space-y-5">
+        <main className="col-span-8 px-7 py-8">
           {mainSections.map((sec, idx) => (
             <section
               key={sec.id}
+              style={{ marginTop: idx === 0 && sec.spacingBeforePx === undefined ? 0 : sectionGapPx(style, sec) }}
+              {...getSectionDragProps(sec.id, 'right')}
               onClick={() => onSelectSection?.(sec.type === 'summary' ? 'basics' : sec.id)}
-              className="group/sec relative cursor-pointer space-y-2.5 hover:bg-slate-50/80 -mx-2 px-2 py-1 rounded transition-colors"
+              className={'group/sec relative cursor-pointer space-y-2.5 hover:bg-slate-50/80 -mx-2 px-2 py-1 rounded transition-colors ' +
+                (dragOverSecId === sec.id ? 'ring-2 ring-blue-500 bg-blue-50/40' : '')}
             >
               {renderOnCanvasControls(sec, idx, mainSections.length, true)}
-              <div className="flex items-center justify-between gap-3 border-b border-slate-200 pb-1">
+              <div data-cv-section-heading className="flex items-center justify-between gap-3 border-b border-slate-200 pb-1">
                 <h2
                   className="text-[1.08em] font-bold tracking-tight"
                   style={{ color: style.accentColor }}
                 >
-                  {sec.title}
-                </h2>
+                    {editSectionTitle(sec)}
+                  </h2>
                 {renderSectionAIButton(sec)}
               </div>
-              {renderSectionBody(sec, false)}
+              <div data-cv-section-body>{renderSectionBody(sec, false)}</div>
             </section>
           ))}
         </main>
@@ -1763,8 +2164,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
     return (
       <div
         ref={sheetRef}
-        id="a4-resume-sheet"
-        className={`w-[210mm] min-h-[297mm] bg-white text-slate-900 shadow-sm border border-slate-200 relative ${paddingClass} ${fontSizeClass} ${lineHeightClass} ${sectionGapClass}`}
+        id={previewId}
+        {...rhythmAttributes}
+        style={rhythmVars as React.CSSProperties}
+        className={`w-[210mm] min-h-[297mm] bg-white text-slate-900 shadow-sm border border-slate-200 relative ${paddingClass} ${fontSizeClass} ${lineHeightClass}`}
       >
         <header
           onClick={() => onSelectSection?.('basics')}
@@ -1772,10 +2175,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         >
           <div className="flex-1 space-y-1.5">
             <div className="flex flex-wrap items-center gap-x-3">
-              <h1 className="text-[22px] font-bold tracking-tight text-slate-950">{basics.name}</h1>
-              <span className="text-[14px] font-semibold text-slate-800">{basics.title}</span>
+              <h1 className="text-[22px] font-bold tracking-tight text-slate-950">{editBasic('name')}</h1>
+              <span data-ats-role-title className="text-[14px] font-semibold text-slate-800">{editBasic('title')}</span>
               {basics.directionTags && (
-                <span className="text-[12.5px] text-slate-600">· {basics.directionTags}</span>
+                <span data-ats-direction-tags className="text-[12.5px] text-slate-600">· {basics.directionTags}</span>
               )}
               {renderItemAIButton(
                 {
@@ -1788,29 +2191,29 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[0.93em] text-slate-700 font-mono tabular-nums">
-              {basics.phone && <span>{basics.phone}</span>}
+              {basics.phone && <span>{editBasic('phone')}</span>}
               {basics.email && (
                 <>
                   <span className="text-slate-300">|</span>
-                  <span>{basics.email}</span>
+                  <span>{editBasic('email')}</span>
                 </>
               )}
               {basics.github && (
                 <>
                   <span className="text-slate-300">|</span>
-                  <span>{basics.github}</span>
+                  <span>{editBasic('github')}</span>
                 </>
               )}
               {basics.graduationYear && (
                 <>
                   <span className="text-slate-300">|</span>
-                  <span className="font-sans">{basics.graduationYear}</span>
+                  <span className="font-sans">{editBasic('graduationYear')}</span>
                 </>
               )}
               {basics.location && (
                 <>
                   <span className="text-slate-300">|</span>
-                  <span className="font-sans">{basics.location}</span>
+                  <span className="font-sans">{editBasic('location')}</span>
                 </>
               )}
             </div>
@@ -1819,19 +2222,25 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           {renderAvatar(72, 92, 'rounded border border-slate-200')}
         </header>
 
-        <div className={sectionGapClass}>
+        <div>
           {visibleSections.map((sec, idx) => (
             <section
               key={sec.id}
+              data-resume-section={sec.type}
+              style={{ marginTop: sectionGapPx(style, sec) }}
+              {...getSectionDragProps(sec.id)}
               onClick={() => onSelectSection?.(sec.type === 'summary' ? 'basics' : sec.id)}
-              className="group/sec relative cursor-pointer space-y-2 hover:bg-slate-50/70 -mx-2 px-2 py-0.5 rounded transition-colors"
+              className={'group/sec relative cursor-pointer space-y-2 hover:bg-slate-50/70 -mx-2 px-2 py-0.5 rounded transition-colors ' +
+                (dragOverSecId === sec.id ? 'ring-2 ring-blue-500 bg-blue-50/40' : '')}
             >
               {renderOnCanvasControls(sec, idx, visibleSections.length, false)}
-              <div className="border-b border-slate-900 pb-0.5 flex items-center justify-between gap-2">
-                <h2 className="text-[1.08em] font-bold tracking-tight text-slate-950">{sec.title}</h2>
+              <div data-ats-section-heading data-cv-section-heading className="border-b border-slate-900 pb-0.5 flex items-center justify-between gap-2">
+                <h2 className="text-[1.08em] font-bold tracking-tight text-slate-950">
+                    {editSectionTitle(sec)}
+                  </h2>
                 {renderSectionAIButton(sec)}
               </div>
-              {renderSectionBody(sec, true)}
+              <div data-cv-section-body>{renderSectionBody(sec, true)}</div>
             </section>
           ))}
         </div>
@@ -1847,8 +2256,10 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
   return (
     <div
       ref={sheetRef}
-      id="a4-resume-sheet"
-      className={`w-[210mm] min-h-[297mm] bg-white text-slate-900 shadow-sm border border-slate-200 relative ${paddingClass} ${fontSizeClass} ${lineHeightClass} ${sectionGapClass}`}
+      id={previewId}
+      {...rhythmAttributes}
+      style={rhythmVars as React.CSSProperties}
+      className={`w-[210mm] min-h-[297mm] bg-white text-slate-900 shadow-sm border border-slate-200 relative ${paddingClass} ${fontSizeClass} ${lineHeightClass}`}
     >
       <header
         onClick={() => onSelectSection?.('basics')}
@@ -1856,10 +2267,8 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
       >
         <div className="flex-1 space-y-2">
           <div className="flex flex-wrap items-center gap-x-3">
-            <h1 className="text-[24px] font-bold tracking-tight text-slate-900">{basics.name}</h1>
-            <span className="text-[15px] font-semibold" style={{ color: style.accentColor }}>
-              {basics.title}
-            </span>
+            <h1 className="text-[24px] font-bold tracking-tight text-slate-900">{editBasic('name')}</h1>
+            <span className="text-[15px] font-semibold" style={{ color: style.accentColor }}>{editBasic('title')}</span>
             {basics.directionTags && (
               <span className="text-[12.5px] text-slate-500">· {basics.directionTags}</span>
             )}
@@ -1874,29 +2283,29 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.93em] text-slate-600">
-            {basics.phone && <span className="font-mono tabular-nums text-slate-800">{basics.phone}</span>}
+            {basics.phone && <span className="font-mono tabular-nums text-slate-800">{editBasic('phone')}</span>}
             {basics.email && (
               <>
                 <span aria-hidden="true" className="text-slate-300">·</span>
-                <span className="font-mono text-slate-800">{basics.email}</span>
+                <span className="font-mono text-slate-800">{editBasic('email')}</span>
               </>
             )}
             {basics.github && (
               <>
                 <span aria-hidden="true" className="text-slate-300">·</span>
-                <span className="font-mono text-slate-800">{basics.github}</span>
+                <span className="font-mono text-slate-800">{editBasic('github')}</span>
               </>
             )}
             {basics.graduationYear && (
               <>
                 <span aria-hidden="true" className="text-slate-300">·</span>
-                <span>{basics.graduationYear}</span>
+                <span>{editBasic('graduationYear')}</span>
               </>
             )}
             {basics.location && (
               <>
                 <span aria-hidden="true" className="text-slate-300">·</span>
-                <span>{basics.location}</span>
+                <span>{editBasic('location')}</span>
               </>
             )}
           </div>
@@ -1905,15 +2314,20 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
         {renderAvatar(80, 100, 'rounded border border-slate-200')}
       </header>
 
-      <div className={sectionGapClass}>
+      <div>
         {visibleSections.map((sec, index) => (
           <section
             key={sec.id}
+            data-resume-section={sec.type}
+            style={{ marginTop: sectionGapPx(style, sec) }}
+            {...getSectionDragProps(sec.id)}
             onClick={() => onSelectSection?.(sec.type === 'summary' ? 'basics' : sec.id)}
-            className="group/sec relative cursor-pointer space-y-2 hover:bg-slate-50/70 -mx-2 px-2 py-1 rounded transition-colors"
+            className={'group/sec relative cursor-pointer space-y-2 hover:bg-slate-50/70 -mx-2 px-2 py-1 rounded transition-colors ' +
+              (dragOverSecId === sec.id ? 'ring-2 ring-blue-500 bg-blue-50/40' : '')}
           >
             {renderOnCanvasControls(sec, index, visibleSections.length, false)}
             <div
+              data-cv-section-heading
               className="flex items-center justify-between pb-1 border-b gap-2"
               style={{ borderColor: `${style.accentColor}30` }}
             >
@@ -1928,12 +2342,12 @@ export const ResumePreview: React.FC<ResumePreviewProps> = ({
                   className="text-[1.08em] font-bold tracking-tight"
                   style={{ color: style.accentColor }}
                 >
-                  {sec.title}
-                </h2>
+                    {editSectionTitle(sec)}
+                  </h2>
               </div>
               {renderSectionAIButton(sec)}
             </div>
-            {renderSectionBody(sec, false)}
+            <div data-cv-section-body>{renderSectionBody(sec, false)}</div>
           </section>
         ))}
       </div>

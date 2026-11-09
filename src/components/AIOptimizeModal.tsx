@@ -1,4 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import { aiFetch } from '../utils/aiModelClient';
+import React, { useEffect, useRef, useState } from 'react';
+import { validateOptimizedItem } from '../utils/resumeGenerationGuard';
+import { loadRetrievedMasterFacts } from '../utils/masterFactRetrieval';
+import { loadRetrievedMasterContent } from '../utils/masterContentDraft';
+import {loadMasterAIReferences} from '../utils/masterSourceRetrieval';
 import {
   AwardItem,
   CustomSectionItem,
@@ -85,6 +90,7 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [loadingPhase, setLoadingPhase] = useState<'reading_skills' | 'optimizing'>('reading_skills');
   const [error, setError] = useState<string | null>(null);
+  const requestSeqRef = useRef(0);
 
   // AI Skills State (persisted in localStorage)
   const [isSkillBoxExpanded, setIsSkillBoxExpanded] = useState(false);
@@ -98,7 +104,7 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
   const [newSkillCategory, setNewSkillCategory] = useState('自定义技能');
   const [newSkillDesc, setNewSkillDesc] = useState('');
   const [newSkillMarkdown, setNewSkillMarkdown] = useState(
-    `# 技能名称：自定义专业简历优化规范\n\n## 1. 核心术语要求\n- 突出核心芯片架构、外设协议与软件工程规范。\n\n## 2. 句式与量化准则\n- 每条以强有力动词开头，补充具体性能指标并用 **粗体** 标注。`
+    `# 技能名称：自定义专业简历优化规范\n\n## 1. 岗位价值表达\n- 突出目标岗位相关的真实职责、方法、成果或业务贡献；不预设行业和年资。\n\n## 2. 表述与量化准则\n- 无数字也可有力描述成果；仅在原材料已有时使用具体数字，不编造经历、身份或指标。`
   );
 
   const [result, setResult] = useState<{
@@ -108,6 +114,7 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
     improvementNotes: string;
     highlights: string[];
     optimizedData: any;
+    sourceSnapshot: string;
   } | null>(null);
 
   const extractPayload = (t: AIOptimizeTarget) => {
@@ -147,9 +154,11 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
     allSkills: AISkill[] = skills,
     useAutoSelect: boolean = autoSkillMode
   ) => {
+    const requestSeq = ++requestSeqRef.current;
     setLoading(true);
     setLoadingPhase('reading_skills');
     setError(null);
+    setResult(null);
 
     const phaseTimer = window.setTimeout(() => {
       setLoadingPhase('optimizing');
@@ -157,6 +166,22 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
 
     try {
       const payload = extractPayload(activeTarget);
+      const sourceSnapshot = JSON.stringify(payload);
+      const masterFacts = await loadRetrievedMasterFacts(resume, [resume.basics.title, activeTarget.sectionTitle, sourceSnapshot].join(' '), activeTarget.sectionType).catch(() => []);
+      const contentTitle = activeTarget.sectionType==='projects'
+        ? (payload as ProjectItem)?.name
+        : activeTarget.sectionType==='experience'
+          ? (payload as ExperienceItem)?.company : undefined;
+      const masterContent = await loadRetrievedMasterContent(
+        [resume.basics.title, activeTarget.sectionTitle, sourceSnapshot].join(' '),
+        activeTarget.sectionType,contentTitle,2,
+      ).catch(()=>[]);
+      // Saved extractions are the source of truth. No original file is reopened for them.
+      const {masterStructured,masterRaw}=await loadMasterAIReferences(
+        [resume.basics.title,activeTarget.sectionTitle,sourceSnapshot].join(' ')
+      ).catch(()=>({masterStructured:[],masterRaw:[]}));
+
+
       let effectiveSkillIds = activeSkillIds;
       let localReason = autoMatchReason;
 
@@ -176,7 +201,7 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
 
       const activeSkillsPayload = allSkills.filter((s) => effectiveSkillIds.includes(s.id));
 
-      const res = await fetch('/api/ai/optimize-section', {
+      const res = await aiFetch('/api/ai/optimize-section', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -186,15 +211,23 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
           mode: activeMode,
           customPrompt: extraPrompt.trim(),
           payload,
+          masterFacts,
+          masterContent,
+          masterStructured,
+          masterRaw,
           selectedSkills: activeSkillsPayload,
           autoSelectSkills: useAutoSelect,
           availableSkills: allSkills,
         }),
       });
       const data = await res.json();
+      if (requestSeq !== requestSeqRef.current) return;
       if (!res.ok) {
-        throw new Error(data.error || 'AI 单项优化服务响应异常');
+        throw new Error([data.error, ...(Array.isArray(data.issues) ? data.issues : [])].filter(Boolean).join('；') || 'AI 单项优化服务响应异常');
       }
+
+      const validationIssues = validateOptimizedItem(activeTarget.sectionType, payload, data.optimizedData);
+      if (validationIssues.length) throw new Error('AI 优化结果不符合事实/结构规范：' + validationIssues.join('；'));
 
       // If AI backend returned refined autoMatchedSkillIds, sync them to UI
       if (useAutoSelect && Array.isArray(data.autoMatchedSkillIds) && data.autoMatchedSkillIds.length > 0) {
@@ -216,12 +249,13 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
         improvementNotes: data.improvementNotes || '已结合所选技能完成该单项类目专业润色',
         highlights: Array.isArray(data.highlights) ? data.highlights : [],
         optimizedData: data.optimizedData,
+        sourceSnapshot,
       });
     } catch (err: any) {
-      setError(err?.message || 'AI 优化失败，请稍后重试');
+      if (requestSeq === requestSeqRef.current) setError(err?.message || 'AI 优化失败，请稍后重试');
     } finally {
       window.clearTimeout(phaseTimer);
-      setLoading(false);
+      if (requestSeq === requestSeqRef.current) setLoading(false);
     }
   };
 
@@ -383,9 +417,22 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
   };
 
   const handleApply = () => {
-    if (!result || !result.optimizedData) return;
-    const opt = Array.isArray(result.optimizedData) ? result.optimizedData[0] : result.optimizedData;
-    if (!opt) return;
+    if (!result || !result.optimizedData || !target) return;
+    if (result.sourceSnapshot !== JSON.stringify(extractPayload(target))) {
+      setError('该条目已被修改，AI 候选结果过期。请重新生成后再应用，避免覆盖最新内容。');
+      return;
+    }
+    const opt = result.optimizedData;
+    const issues = validateOptimizedItem(target.sectionType, extractPayload(target), opt);
+    if (issues.length) {
+      setError('AI 候选变更未通过事实校验：' + issues.join('；'));
+      return;
+    }
+    if (result.sourceSnapshot === JSON.stringify(opt)) {
+      setError('AI 未产生实际改动，无需覆盖当前条目。');
+      return;
+    }
+    if (!window.confirm('请再次核对该 AI 改写没有夸大您的实际贡献、测试结果或技能。确定将预览内容应用到当前条目吗？')) return;
 
     onApplyOptimizedSection((prev) => {
       switch (target.sectionType) {
@@ -994,10 +1041,10 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
             <span className="text-xs font-semibold text-slate-700">第二步：选择基础润色侧重点：</span>
             <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/80 rounded-md">
               {[
-                { id: 'star', label: 'STAR 工程量化重构' },
-                { id: 'hardware_arch', label: '强化嵌入式/硬件专业度' },
-                { id: 'quantify', label: '突出核心指标加粗' },
-                { id: 'concise', label: '一页纸高密度精简' },
+                { id: 'star', label: 'STAR 价值表达' },
+                { id: 'hardware_arch', label: '强化领域专业度' },
+                { id: 'quantify', label: '突出已有成果指标' },
+                { id: 'concise', label: '精炼与篇幅优化' },
               ].map((m) => (
                 <button
                   key={m.id}
@@ -1031,7 +1078,7 @@ export const AIOptimizeModal: React.FC<AIOptimizeModalProps> = ({
                   runOptimization(target, mode, customPrompt, selectedSkillIds, skills, autoSkillMode);
                 }
               }}
-              placeholder="可选：补充额外指令（如：重点突出 FreeRTOS 消息队列与 ADC+DMA 双缓冲指标）..."
+              placeholder="可选：例如突出项目职责、技术难点、交付价值或跨岗位可迁移能力，不添加未做过的事实..."
               className="flex-1 px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:border-blue-600"
             />
             <button

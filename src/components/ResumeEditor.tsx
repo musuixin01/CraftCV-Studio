@@ -1047,6 +1047,13 @@ export const ResumeEditor: React.FC<ResumeEditorProps> = ({
                   </div>
 
                   <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">加权平均分（与 GPA 独立）</label>
+                    <input type="text" value={edu.weightedAverage??''} placeholder="例如：88.75 / 100"
+                      onChange={(e)=>onChangeResume((prev)=>({
+                        ...prev,education:prev.education.map((x)=>x.id===edu.id?{...x,weightedAverage:e.target.value}:x)
+                      }))} className="os26-input w-full px-3 py-1.5 text-xs font-mono bg-white"/>
+                  </div>
+                  <div>
                     <label className="block text-[11px] font-medium text-slate-500 mb-1">核心主修课程</label>
                     <input
                       type="text"
@@ -1061,6 +1068,41 @@ export const ResumeEditor: React.FC<ResumeEditorProps> = ({
                       }
                       className="os26-input w-full px-3 py-1.5 text-xs bg-white"
                     />
+                  </div>
+                  <div className="space-y-2 rounded-xl border border-slate-200/70 bg-white/65 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-semibold text-slate-800">课程成绩明细</p>
+                        <p className="text-[11px] text-slate-500">按课程独立保存，不合并 GPA；不会自动增加投递 PDF 内容。</p>
+                      </div>
+                      <button type="button" onClick={() => onChangeResume((prev) => ({
+                        ...prev,education:prev.education.map((x)=>x.id===edu.id?{
+                          ...x,courseGrades:[...(x.courseGrades??[]),{id:'cg-'+crypto.randomUUID(),course:'',score:''}]
+                        }:x),
+                      }))} className="os26-press shrink-0 rounded-lg px-2 py-1 text-[11px] text-[#0071e3] bg-[#0071e3]/10">+ 添加</button>
+                    </div>
+                    {(edu.courseGrades??[]).map((grade)=>(
+                      <div key={grade.id} className="flex items-center gap-2">
+                        <input aria-label="课程名称" type="text" value={grade.course} placeholder="课程名称"
+                          className="os26-input min-w-0 flex-1 px-2.5 py-1.5 text-xs"
+                          onChange={(e)=>onChangeResume((prev)=>({
+                            ...prev,education:prev.education.map((x)=>x.id===edu.id?{
+                              ...x,courseGrades:(x.courseGrades??[]).map((g)=>g.id===grade.id?{...g,course:e.target.value}:g)
+                            }:x)
+                          }))}/>
+                        <input aria-label="课程成绩" type="text" value={grade.score} placeholder="分数" className="os26-input w-[78px] px-2 py-1.5 text-xs"
+                          onChange={(e)=>onChangeResume((prev)=>({
+                            ...prev,education:prev.education.map((x)=>x.id===edu.id?{
+                              ...x,courseGrades:(x.courseGrades??[]).map((g)=>g.id===grade.id?{...g,score:e.target.value}:g)
+                            }:x)
+                          }))}/>
+                        <button type="button" aria-label={'移除课程 '+grade.course} className="p-1 text-slate-400 hover:text-red-600" onClick={()=>onChangeResume((prev)=>({
+                          ...prev,education:prev.education.map((x)=>x.id===edu.id?{
+                            ...x,courseGrades:(x.courseGrades??[]).filter((g)=>g.id!==grade.id)
+                          }:x)
+                        }))}><Trash2 className="w-3.5 h-3.5"/></button>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ))}
@@ -1753,6 +1795,31 @@ export const ResumeEditor: React.FC<ResumeEditorProps> = ({
                       placeholder="括号补充说明（如：三级 / 高级工）"
                       className="os26-input px-3 py-1.5 text-xs bg-white"
                     />
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <label className="text-[11px] text-slate-600">类型
+                      <select aria-label="证书奖项类型" value={aw.credentialType??'award'}
+                        onChange={(e)=>onChangeResume((prev)=>({
+                          ...prev,awards:prev.awards.map((x)=>x.id===aw.id?{
+                            ...x,credentialType:e.target.value==='certificate'?'certificate':'award'
+                          }:x)
+                        }))} className="os26-input mt-1 w-full px-2.5 py-1.5 text-xs">
+                        <option value="award">荣誉 / 竞赛奖项</option>
+                        <option value="certificate">职业 / 技能证书</option>
+                      </select>
+                    </label>
+                    <label className="text-[11px] text-slate-600">颁发单位
+                      <input aria-label="颁发单位" type="text" value={aw.issuer} placeholder="颁发单位"
+                        onChange={(e)=>onChangeResume((prev)=>({
+                          ...prev,awards:prev.awards.map((x)=>x.id===aw.id?{...x,issuer:e.target.value}:x)
+                        }))} className="os26-input mt-1 w-full px-2.5 py-1.5 text-xs"/>
+                    </label>
+                    <label className="text-[11px] text-slate-600">颁发 / 获奖日期
+                      <input aria-label="颁发获奖日期" type="text" value={aw.date} placeholder="YYYY.MM"
+                        onChange={(e)=>onChangeResume((prev)=>({
+                          ...prev,awards:prev.awards.map((x)=>x.id===aw.id?{...x,date:e.target.value}:x)
+                        }))} className="os26-input mt-1 w-full px-2.5 py-1.5 text-xs"/>
+                    </label>
+                  </div>
                   </div>
                 </div>
               ))}

@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Never commit uploaded resumes or local user documents.
+/_private/
+/public/assets/aistudio/*
+
+# Generated Python bytecode and test-only caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/

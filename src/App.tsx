@@ -1,34 +1,48 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { DEFAULT_EE_RESUME, UPLOADED_PDF_EXACT_RESUME } from './data/defaultResume';
+import { DEFAULT_EE_RESUME } from './data/defaultResume';
+import { jsPDF } from 'jspdf';
 import {
   ProjectItem,
   ResumeDocument,
   ResumeSlot,
   SectionColumn,
   SectionConfig,
-  TemplateId,
 } from './types/resume';
 import { PageMetrics, ResumePreview, getEffectiveColumn } from './components/ResumePreview';
 import { ResumeEditor } from './components/ResumeEditor';
 import { GitHubImportPanel } from './components/GitHubImportPanel';
 import { JDMatchPanel } from './components/JDMatchPanel';
+import { AIModelSelector } from './components/AIModelSelector';
+import { validateStoredResume } from './utils/resumeGenerationGuard';
+import { reconcileImportFactLedger } from './utils/resumeImportReview';
+import { buildExportQualityReport, type ExportFormat, type ExportQualityReport } from './utils/exportQualityPreflight';
+import { ExportQualityDialog } from './components/ExportQualityDialog';
+import { ImagePdfPaginationError, measureImagePdfBreakBands, planImagePdfSlices } from './utils/imagePdfPagination';
+import { compactOnePageSpacing, compactOnePageStyle, needsSinglePage, SinglePageLimitError } from './utils/onePageResume';
 import { TemplateStylePanel } from './components/TemplateStylePanel';
+import { reorderSections } from './utils/reorderSections';
+import { getTemplateOption, TEMPLATE_CATALOG } from './data/templateCatalog';
 import { ResumeManagerPanel } from './components/ResumeManagerPanel';
 import { AISkillLibraryCard } from './components/AISkillLibraryCard';
+
 import { ResumeImportModal } from './components/ResumeImportModal';
+import { EvidenceAttachmentsModal } from './components/EvidenceAttachmentsModal';
+import { MasterComposeDialog } from './components/MasterComposeDialog';
+import type { MasterContentEntry } from './utils/masterContentStore';
+import { applyMasterEvidenceFact } from './utils/masterFactAdoption';
 import { AIOptimizeModal, AIOptimizeTarget } from './components/AIOptimizeModal';
-import { domToCanvas } from 'modern-screenshot';
-import { jsPDF } from 'jspdf';
+import { OnePageAICompactDialog } from './components/OnePageAICompactDialog';
 import {
   CheckCircle2,
   ChevronDown,
   Download,
   FileText,
+  Loader2,
   FileUp,
+  FileCheck2,
   FolderKanban,
   GitBranchPlus,
   Layers,
-  Loader2,
   Minimize2,
   Pencil,
   Printer,
@@ -42,7 +56,6 @@ import {
 } from 'lucide-react';
 
 type WorkspaceTab = 'resumes' | 'editor' | 'ai-skills' | 'github' | 'jd-match' | 'style';
-
 const STORAGE_KEY = 'craftcv_ee_resume_v4_movable';
 const SLOTS_STORAGE_KEY = 'craftcv_resume_slots_v2_lanes';
 const LEGACY_SLOTS_STORAGE_KEY = 'craftcv_resume_slots_v1';
@@ -199,19 +212,6 @@ function loadInitialSlots(initialResume: ResumeDocument): ResumeSlot[] {
       updatedAt: new Date(Date.now() - 3600 * 1000 * 1).toISOString(),
       data: eeRefinedCopy,
     },
-    {
-      id: 'slot-pdf-exact',
-      name: '信宏恩_PDF原版定向简历',
-      roleCategory: '软件工程师 / 测试与技术支持',
-      versionTag: 'v1.0',
-      targetCompany: '库课科技 / 软件与测试岗',
-      notes: '1:1 还原上传的 PDF 原版排版与全部项目、实习及荣誉内容',
-      updatedAt: new Date().toISOString(),
-      data: {
-        ...UPLOADED_PDF_EXACT_RESUME,
-        sections: ensureSummarySection(UPLOADED_PDF_EXACT_RESUME.sections),
-      },
-    },
   ];
 }
 
@@ -272,20 +272,56 @@ export default function App() {
     isOverflowing: false,
     fillPercent: 100,
   });
+  // A completed AI edit is shown only after ResumePreview has measured the
+  // exact new document, not an earlier layout or another resume slot.
+  const pendingAiCompactCountRef = useRef<{
+    count: number;
+    snapshot: string;
+    slotId: string;
+    kind: 'content' | 'spacing';
+  } | null>(null);
+  const [lastAiCompactReview, setLastAiCompactReview] = useState<{
+    count: number;
+    snapshot: string;
+    slotId: string;
+    kind: 'content' | 'spacing';
+    metrics: PageMetrics;
+  } | null>(null);
+  const previewDeskRef = useRef<HTMLDivElement | null>(null);
+  const inspectorRef = useRef<HTMLDivElement | null>(null);
 
   const lastCoalescedTimeRef = useRef<number>(0);
 
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('editor');
   const [activeSectionId, setActiveSectionId] = useState<string | null>('sec-proj');
   const [zoom, setZoom] = useState<number>(0.82);
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerWidth : 1280);
+  const [fitPreviewToWidth, setFitPreviewToWidth] = useState(true);
+  // 210mm A4 = ~794 CSS pixels. Only the on-screen preview is scaled;
+  // PDF capture and ATS print layouts always retain their native dimensions.
+  const mobileFitZoom = Math.max(0.35, (viewportWidth - 48) / 794);
+  const effectiveZoom = viewportWidth < 640 && fitPreviewToWidth
+    ? Math.min(zoom, mobileFitZoom)
+    : zoom;
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [aiOptimizeTarget, setAiOptimizeTarget] = useState<AIOptimizeTarget | null>(null);
-  const [isExportingPDF, setIsExportingPDF] = useState(false);
+  const [showOnePageAI, setShowOnePageAI] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showEvidenceModal, setShowEvidenceModal] = useState(false);
+  const [showMasterCompose, setShowMasterCompose] = useState(false);
+  const [isExportingPDF, setIsExportingPDF] = useState(false);
+  const [pendingExport, setPendingExport] = useState<{
+    format: ExportFormat;
+    resumeSnapshot: string;
+    report: ExportQualityReport;
+    slotId: string;
+  } | null>(null);
+  const pdfCaptureRef = useRef<HTMLDivElement | null>(null);
+  const atsPrintRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const docPopoverRef = useRef<HTMLDivElement | null>(null);
-  const pdfCaptureRef = useRef<HTMLDivElement | null>(null);
 
   const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
@@ -293,6 +329,29 @@ export default function App() {
       setToastMsg((prev) => (prev === msg ? null : prev));
     }, 3000);
   }, []);
+
+  const activeAiCompactReview = lastAiCompactReview?.slotId === activeSlotId &&
+    lastAiCompactReview.snapshot === JSON.stringify(resume) ? lastAiCompactReview : null;
+
+  useEffect(() => {
+    const updateViewport = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', updateViewport);
+    return () => window.removeEventListener('resize', updateViewport);
+  }, []);
+
+  const handlePageMetricsChange = useCallback((metrics: PageMetrics, measuredResume: ResumeDocument) => {
+    setPageMetrics((previous) =>
+      previous.heightPx === metrics.heightPx &&
+      previous.fillPercent === metrics.fillPercent &&
+      previous.isOverflowing === metrics.isOverflowing ? previous : metrics);
+    const pending = pendingAiCompactCountRef.current;
+    if (!pending || JSON.stringify(measuredResume) !== pending.snapshot) return;
+    pendingAiCompactCountRef.current = null;
+    setLastAiCompactReview({ ...pending, metrics });
+    showToast(metrics.isOverflowing
+      ? `已更新 A4 预览：内容仍超出一页，精简可撤销或继续调整。`
+      : `已更新 A4 预览，当前未超出一页；正式导出仍需检查。`);
+  }, [showToast]);
 
   // Close OS 26 Document Popover when clicking outside
   useEffect(() => {
@@ -324,12 +383,11 @@ export default function App() {
     ) => {
       const now = Date.now();
       setHistory((curr) => {
-        const nextPresent =
+        const requested =
           typeof updater === 'function' ? updater(curr.present) : updater;
+        if (requested === curr.present) return curr;
 
-        if (nextPresent === curr.present) {
-          return curr;
-        }
+        const nextPresent = reconcileImportFactLedger(curr.present, requested);
 
         const isStructuralSectionChange =
           JSON.stringify(curr.present.sections) !== JSON.stringify(nextPresent.sections) ||
@@ -378,21 +436,34 @@ export default function App() {
   );
 
   const handleAutoFitOnePage = useCallback(() => {
-    commitResumeChange(
-      (prev) => ({
-        ...prev,
-        style: {
-          ...prev.style,
-          fontSize: 'sm',
-          lineHeight: 'tight',
-          pageMargin: 'compact',
-          sectionSpacing: 12,
-        },
-      }),
-      false
-    );
-    showToast('已自动压缩字号、行距与页边距，收敛至单页 A4');
+    commitResumeChange((prev) => ({
+      ...prev,
+      style: compactOnePageStyle(prev.style),
+    }), false);
+    showToast('已尝试收敛留白并启用单页限制；未删除经历或缩小标准字号。若仍超页，请自行精简或允许多页。');
   }, [commitResumeChange, showToast]);
+
+  const handleTightenAfterAi = () => {
+    if (!activeAiCompactReview) return;
+    const nextStyle = compactOnePageSpacing(resume.style);
+    if (JSON.stringify(nextStyle) === JSON.stringify(resume.style)) {
+      showToast('间距已经是当前安全紧凑设置，请检查模块内容或切换模板。');
+      return;
+    }
+    if (!window.confirm('确认压缩排版间距吗？仅调整全局模块间距、行距与页边距，保留字号、项目内容和单独设置的模块间距；可撤销。')) return;
+    const sourceSnapshot = JSON.stringify(resume);
+    const prepared = reconcileImportFactLedger(resume, { ...resume, style: nextStyle });
+    pendingAiCompactCountRef.current = {
+      count: activeAiCompactReview.count,
+      snapshot: JSON.stringify(prepared),
+      slotId: activeSlotId,
+      kind: 'spacing',
+    };
+    setLastAiCompactReview(null);
+    commitResumeChange((prev) =>
+      JSON.stringify(prev) === sourceSnapshot ? prepared : prev,
+    false);
+  };
 
   const handleUndo = useCallback(() => {
     lastCoalescedTimeRef.current = 0;
@@ -530,7 +601,7 @@ export default function App() {
 
   const handleCreateSlotInLane = (
     roleCategory: string,
-    templateSource: 'current' | 'ee-default' | 'pdf-exact',
+    templateSource: 'current' | 'ee-default',
     customName?: string,
     targetCompany?: string
   ) => {
@@ -539,9 +610,7 @@ export default function App() {
     const newId = `slot-${Date.now()}`;
 
     let baseDoc: ResumeDocument;
-    if (templateSource === 'pdf-exact') {
-      baseDoc = JSON.parse(JSON.stringify(UPLOADED_PDF_EXACT_RESUME));
-    } else if (templateSource === 'ee-default') {
+    if (templateSource === 'ee-default') {
       baseDoc = JSON.parse(JSON.stringify(DEFAULT_EE_RESUME));
     } else {
       baseDoc = JSON.parse(JSON.stringify(resume));
@@ -578,6 +647,46 @@ export default function App() {
     showToast(`已在「${roleCategory}」栏下创建 ${nextVer}「${newSlot.name}」`);
   };
 
+
+  const handleCreateFromMaster = (
+    candidate:ResumeDocument,role:string,jd:string,selected:MasterContentEntry[],structuredCount=0,aiChanges=0,
+  ) => {
+    const lane=role.trim();
+    if(!lane || !(selected.length+structuredCount))return false;
+    const existing=slots.filter((slot)=>slot.roleCategory===lane);
+    const versionTag=existing.length===0?'v1.0':'v1.'+existing.length;
+    const id='slot-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
+    const data:ResumeDocument={
+      ...candidate,id,versionName:lane+' · 母版生成稿',
+      updatedAt:new Date().toISOString(),
+      sections:ensureSummarySection(candidate.sections),
+      factLedger:candidate.factLedger?{
+        ...candidate.factLedger,
+        records:candidate.factLedger.records.map((row)=>({...row,versionId:id})),
+      }:undefined,
+    };
+    const issues=validateStoredResume(data);
+    if(issues.length){showToast('生成稿结构异常：'+issues.slice(0,2).join('；'));return false;}
+    const slot:ResumeSlot={
+      id,name:lane+' · 母版选材稿',roleCategory:lane,versionTag,
+      targetCompany:'通用投递',
+      notes:'从当前真实简历和已确认的母版内容生成；项目/经历 '+selected.length+
+        ' 条，教育/技能/奖项 '+structuredCount+' 条；本人确认采用 AI 文本改写 '+aiChanges+' 处。'+
+        (jd?'岗位 JD 已用于本地推荐排序，不会添加未经提供的能力。':'未提供岗位 JD。'),
+      updatedAt:data.updatedAt,data,
+    };
+    const next=[...slots,slot];
+    // Persist before mutating the UI: on storage failure no half-created version remains.
+    try{localStorage.setItem(SLOTS_STORAGE_KEY,JSON.stringify(next));}
+    catch{showToast('本地存储空间不足，新岗位版本没有创建；请先处理存储问题。');return false;}
+    setSlots(next);
+    setActiveSlotId(id);
+    commitResumeChange(data,false);
+    if(!roleLanes.includes(lane))setRoleLanes((prev)=>[...prev,lane]);
+    setActiveTab('editor');
+    showToast('已创建独立岗位版本，选用 '+(selected.length+structuredCount)+' 条真实母版素材，采用 AI 改写 '+aiChanges+' 处。请核对排版。');
+    return true;
+  };
   const handleUpdateSlotMeta = (
     slotId: string,
     patch: Partial<
@@ -711,18 +820,8 @@ export default function App() {
   ) => {
     commitResumeChange((prev) => {
       const sections = ensureSummarySection(prev.sections);
-      const fromIdx = sections.findIndex((s) => s.id === draggedSecId);
-      const toIdx = sections.findIndex((s) => s.id === targetSecId);
-      if (fromIdx === -1 || toIdx === -1) return prev;
-
-      const next = [...sections];
-      const [moved] = next.splice(fromIdx, 1);
-      const updatedMoved: SectionConfig = {
-        ...moved,
-        column: targetColumn ?? getEffectiveColumn(sections[toIdx]),
-      };
-      next.splice(toIdx, 0, updatedMoved);
-      return { ...prev, sections: next };
+      const next = reorderSections(sections, draggedSecId, targetSecId, targetColumn);
+      return next === sections ? prev : { ...prev, sections: next };
     }, false);
   };
 
@@ -740,30 +839,111 @@ export default function App() {
     showToast('已切换证件照所在栏位');
   };
 
-  const handleExportPDF = async () => {
+  // Both export paths share one browser-side quality review; neither claims
+  // to have audited the PDF file before it has actually been generated.
+  const getExportQualityReport = (format: ExportFormat): ExportQualityReport => {
+    const node = format === 'ats'
+      ? atsPrintRef.current?.querySelector<HTMLElement>('#a4-resume-sheet')
+      : pdfCaptureRef.current;
+    const rect = node?.getBoundingClientRect();
+    return buildExportQualityReport({
+      format,
+      basics: resume.basics,
+      visibleSectionCount: resume.sections.filter((section) => section.visible).length,
+      fontLoading: document.fonts?.status === 'loading',
+      singlePageOnly: needsSinglePage(resume.style),
+      geometry: node && rect ? {
+        sheetWidthPx: rect.width,
+        sheetHeightPx: rect.height,
+        scrollHeightPx: node.scrollHeight,
+        scrollWidthPx: node.scrollWidth,
+        clientWidthPx: node.clientWidth,
+      } : null,
+    });
+  };
+
+  const requestExportReview = (format: ExportFormat) => {
+    if (isExportingPDF) return;
+    setPendingExport({
+      format,
+      resumeSnapshot: JSON.stringify(resume),
+      report: getExportQualityReport(format),
+      slotId: activeSlotId,
+    });
+  };
+
+  const handleExportPDF = () => requestExportReview('ats');
+  const handleDownloadImagePDF = () => requestExportReview('image');
+
+  const continueReviewedExport = () => {
+    if (!pendingExport || isExportingPDF) return;
+    const latest = getExportQualityReport(pendingExport.format);
+    if (JSON.stringify(resume) !== pendingExport.resumeSnapshot ||
+        activeSlotId !== pendingExport.slotId ||
+        latest.canContinue !== pendingExport.report.canContinue ||
+        latest.estimatedPages !== pendingExport.report.estimatedPages ||
+        latest.issues.map((issue) => issue.id).join('|') !== pendingExport.report.issues.map((issue) => issue.id).join('|')) {
+      setPendingExport({
+        ...pendingExport,
+        resumeSnapshot: JSON.stringify(resume),
+        report: latest,
+        slotId: activeSlotId,
+      });
+      showToast('简历或排版检测结果发生变化，请再次核对检查结果。');
+      return;
+    }
+    if (!latest.canContinue) return;
+    const format = pendingExport.format;
+    setPendingExport(null);
+    if (format === 'ats') {
+      showToast('正在打开单栏 ATS 打印版。另存 PDF 后请复查字体、页码及末页内容。');
+      window.print();
+      return;
+    }
+    void performDownloadImagePDF();
+  };
+
+  const performDownloadImagePDF = async () => {
     if (isExportingPDF) return;
     const captureNode = pdfCaptureRef.current;
     if (!captureNode) {
-      window.print();
+      showToast('高清图片版尚未准备好，请重新打开预览后重试。');
       return;
     }
 
     setIsExportingPDF(true);
-    showToast('正在渲染 300 DPI 高清 A4 PDF 文件，请稍候...');
+    showToast('正在渲染高清 A4 图片式 PDF，请稍候...');
 
     try {
-      // Wait a tick so any pending React state or font layout settles
-      await new Promise((r) => setTimeout(r, 80));
+      // A screenshot with pending web fonts may use substitute glyph metrics,
+      // making long Chinese headings and technical dates collide in the image.
+      // Do not silently export an unstable snapshot or hang indefinitely.
+      let fontTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          document.fonts.ready,
+          new Promise<never>((_, reject) => {
+            fontTimeout = setTimeout(() => reject(new Error('Fonts did not settle before PDF capture')), 5000);
+          }),
+        ]);
+      } finally {
+        if (fontTimeout !== undefined) clearTimeout(fontTimeout);
+      }
+      if (document.fonts.status === 'loading') throw new Error('Fonts still loading before screenshot');
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
-      const canvas = await domToCanvas(captureNode, {
+      // Load the rasterizer only when a visual PDF is requested so ordinary
+      // editing does not carry its ~200KB implementation in the main bundle.
+      const { default: html2canvas } = await import('html2canvas-pro');
+      // Render the browser's live layout, not an SVG foreignObject clone whose
+      // font reflow can overlap project titles, dates, and multi-line bullets.
+      const canvas = await html2canvas(captureNode, {
         scale: 3,
         backgroundColor: '#ffffff',
-        filter: (node) => {
-          if (node instanceof HTMLElement && node.classList.contains('no-print')) {
-            return false;
-          }
-          return true;
-        },
+        useCORS: true,
+        logging: false,
+        // Unlike modern-screenshot's keep-filter, true means omit this node.
+        ignoreElements: (node) => node.classList?.contains('no-print') ?? false,
       });
 
       const pdf = new jsPDF({
@@ -773,38 +953,43 @@ export default function App() {
         compress: true,
       });
 
-      const pageWidthMm = 210;
-      const pageHeightMm = 297;
-      const imgWidthMm = pageWidthMm;
-      const imgHeightMm = (canvas.height * imgWidthMm) / canvas.width;
-      const imgData = canvas.toDataURL('image/jpeg', 0.96);
+      // The canvas is a single continuous layout. Unlike shifting one giant
+      // JPEG by -297mm repeatedly, split at measured gaps between actual text
+      // lines (in both columns) and keep uncovered paper space white.
+      const pageHeightPx = Math.round(canvas.width * 297 / 210);
+      const { protectedBands, preferredBreaks } = measureImagePdfBreakBands(
+        captureNode, canvas.width, canvas.height,
+      );
+      const { slices } = planImagePdfSlices(
+        canvas.height, pageHeightPx, protectedBands, preferredBreaks,
+      );
+      // Screen preflight is an estimate. Enforce the constraint on the actual
+      // raster slices too, so a strict one-page export cannot save two pages.
+      if (needsSinglePage(resume.style) && slices.length !== 1) {
+        throw new SinglePageLimitError('Current content requires more than one A4 page');
+      }
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = canvas.width;
+      pageCanvas.height = pageHeightPx;
+      const pageContext = pageCanvas.getContext('2d');
+      if (!pageContext) throw new Error('Unable to create an A4 image PDF page canvas');
 
-      // If within single-page A4 height (+3mm tolerance), fit cleanly onto 1 page
-      if (imgHeightMm <= pageHeightMm + 3) {
-        pdf.addImage(
-          imgData,
-          'JPEG',
-          0,
-          0,
-          imgWidthMm,
-          Math.min(imgHeightMm, pageHeightMm),
-          undefined,
-          'FAST'
+      for (const [index, slice] of slices.entries()) {
+        const sourceHeight = slice.end - slice.start;
+        if (sourceHeight <= 0) throw new Error('Invalid image PDF slice range');
+        pageContext.fillStyle = '#ffffff';
+        pageContext.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+        // Only a <=1% final overhang may be fitted; all other pages are kept
+        // at exactly the screenshot pixel scale without shrinking user text.
+        pageContext.drawImage(
+          canvas, 0, slice.start, canvas.width, sourceHeight,
+          0, 0, pageCanvas.width, Math.min(sourceHeight, pageHeightPx),
         );
-      } else {
-        // Multi-page slicing for resumes exceeding 1 A4 page
-        let heightLeft = imgHeightMm;
-        let position = 0;
-
-        pdf.addImage(imgData, 'JPEG', 0, position, imgWidthMm, imgHeightMm, undefined, 'FAST');
-        heightLeft -= pageHeightMm;
-
-        while (heightLeft > 2) {
-          position = heightLeft - imgHeightMm;
-          pdf.addPage();
-          pdf.addImage(imgData, 'JPEG', 0, position, imgWidthMm, imgHeightMm, undefined, 'FAST');
-          heightLeft -= pageHeightMm;
-        }
+        if (index > 0) pdf.addPage();
+        pdf.addImage(
+          pageCanvas.toDataURL('image/jpeg', 0.96),
+          'JPEG', 0, 0, 210, 297, undefined, 'FAST',
+        );
       }
 
       const verSuffix = currentSlot?.versionTag ? `_${currentSlot.versionTag}` : '';
@@ -814,12 +999,16 @@ export default function App() {
         '求职简历'
       ).replace(/[\/\\?%*:|"<>]/g, '-')}${verSuffix}`;
 
+      const actualPages = pdf.getNumberOfPages();
       pdf.save(`${rawFileName}.pdf`);
-      showToast(`已成功下载高清 PDF：${rawFileName}.pdf`);
+      showToast(`已触发高清图片 PDF 下载（${actualPages} 页）：${rawFileName}.pdf`);
     } catch (err) {
       console.error('PDF export error:', err);
-      showToast('PDF 导出遇到问题，正在尝试调起系统打印...');
-      window.print();
+      showToast(err instanceof SinglePageLimitError
+        ? '校招单页模式：实际图片 PDF 超过一页，已取消下载。请调整内容和留白，或主动切换为允许多页。'
+        : err instanceof ImagePdfPaginationError
+          ? '当前内容没有安全的跨页断点，已取消图片导出以避免截断文字。请调整模块位置或使用 ATS 文字 PDF。'
+          : '高清图片 PDF 生成失败，没有自动切换为 ATS 文字版。请检查预览后重试。');
     } finally {
       setIsExportingPDF(false);
     }
@@ -849,17 +1038,19 @@ export default function App() {
     reader.onload = () => {
       try {
         const parsed = JSON.parse(String(reader.result));
-        if (parsed && parsed.basics && Array.isArray(parsed.sections)) {
+        const issues = validateStoredResume(parsed);
+        if (issues.length === 0) {
           commitResumeChange(
             {
               ...parsed,
+              customSections: parsed.customSections ?? [],
               sections: ensureSummarySection(parsed.sections),
             },
             false
           );
           showToast('成功导入简历 JSON 数据');
         } else {
-          showToast('JSON 文件格式不兼容，请检查文件');
+          showToast('JSON 格式不完整，未替换当前简历：' + issues[0]);
         }
       } catch {
         showToast('解析 JSON 文件失败');
@@ -986,7 +1177,7 @@ export default function App() {
       {/* =====================================================================
           STRICT 3-ZONE TOP BAR CONTRACT (Apple OS 26 Translucent Glass Bar)
          ===================================================================== */}
-      <header className="no-print sticky top-0 z-30 os26-glass-bar border-b flex items-center justify-between gap-8 px-6 py-3">
+      <header className="no-print sticky top-0 z-30 os26-glass-bar border-b flex flex-wrap lg:flex-nowrap items-center justify-between gap-x-4 gap-y-2 lg:gap-8 px-3 sm:px-6 py-2 lg:py-3">
         {/* Zone 1: Single text element wordmark */}
         <a
           href="#top"
@@ -994,16 +1185,17 @@ export default function App() {
             e.preventDefault();
             setActiveTab('editor');
           }}
-          className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 font-display"
+          className="order-1 lg:order-none text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 font-display"
         >
           CraftCV Studio
         </a>
 
         {/* Zone 2: Concise single-line text navigation links */}
-        <nav className="flex items-center gap-6 text-sm font-medium text-slate-600 overflow-x-auto">
+        <nav className="order-2 lg:order-none w-full lg:w-auto min-w-0 flex items-center gap-4 lg:gap-6 text-sm font-medium text-slate-600 overflow-x-auto">
           {[
             { id: 'editor', label: '内容编辑' },
             { id: 'ai-skills', label: 'AI技能库' },
+
             { id: 'github', label: 'GitHub导入' },
             { id: 'jd-match', label: 'AI岗位匹配' },
             { id: 'style', label: '模板与版式' },
@@ -1031,24 +1223,35 @@ export default function App() {
         </nav>
 
         {/* Zone 3: 1 primary action */}
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="order-3 lg:order-none w-full lg:w-auto min-w-0 flex items-center gap-2 lg:gap-3 overflow-x-auto lg:overflow-visible shrink-0">
+          <AIModelSelector />
+          <a
+            href="https://career-tracker-baimuxi-20261105.baimuxi01.chatgpt.site"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="打开求职工作台；请先导出 PDF，再在简历管理中上传"
+            className="os26-press px-3 py-1.5 text-xs font-semibold text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-xl whitespace-nowrap shrink-0"
+          >
+            求职工作台 ↗
+          </a>
+          <button
+            type="button"
+            onClick={handleDownloadImagePDF}
+            disabled={isExportingPDF}
+            title="沿用原有一键下载的高清图片式 PDF（版式精确，但文字不可复制）"
+            className="os26-press px-3 py-1.5 text-xs font-semibold text-white bg-[#0071e3] hover:bg-[#0077ed] disabled:opacity-60 rounded-xl shadow-xs whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+          >
+            {isExportingPDF ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            <span>{isExportingPDF ? '导出中...' : '一键高清 PDF'}</span>
+          </button>
           <button
             type="button"
             onClick={handleExportPDF}
-            disabled={isExportingPDF}
-            className="os26-press px-4 py-1.5 text-xs font-semibold text-white bg-[#0071e3] hover:bg-[#0077ed] disabled:opacity-65 rounded-xl shadow-xs whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+            title="使用同一份简历生成无照片的单栏 ATS 文字版；打开打印窗口另存 A4 PDF"
+            className="os26-press px-3 py-1.5 text-xs font-semibold text-[#0071e3] border border-[#0071e3]/30 hover:bg-blue-50 rounded-xl shadow-xs whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
           >
-            {isExportingPDF ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>正在生成 PDF...</span>
-              </>
-            ) : (
-              <>
-                <Printer className="w-3.5 h-3.5" />
-                <span>导出高清 PDF</span>
-              </>
-            )}
+            <Printer className="w-3.5 h-3.5" />
+            <span>ATS 文字 PDF</span>
           </button>
         </div>
       </header>
@@ -1066,7 +1269,7 @@ export default function App() {
          ===================================================================== */}
       <div className="no-print flex-1 grid grid-cols-1 lg:grid-cols-12 max-w-[1640px] w-full mx-auto">
         {/* Left Pane: Clean OS 26 Inspector & Module Editor */}
-        <div className="lg:col-span-6 xl:col-span-5 border-r border-slate-900/[0.06] bg-white/45 backdrop-blur-md flex flex-col h-[calc(100vh-53px)]">
+        <div ref={inspectorRef} className="lg:col-span-6 xl:col-span-5 border-r border-slate-900/[0.06] bg-white/45 backdrop-blur-md flex flex-col h-[calc(100vh-53px)]">
           {/* Unified OS 26 Document, Role-Lane Version & History Bar */}
           <div className="px-4 py-2.5 os26-glass-bar border-b flex items-center justify-between gap-2 relative z-20">
             {/* Left: OS 26 Role-Lane Version Switcher + 1-Click Branch New Version */}
@@ -1109,7 +1312,16 @@ export default function App() {
                 <span>导入简历</span>
               </button>
 
-              {/* OS 26 Floating Document & Role-Lane Version Popover Sheet */}
+
+              <button
+                type="button"
+                onClick={() => setShowEvidenceModal(true)}
+                className="os26-press px-2.5 py-1.5 rounded-xl bg-slate-900/[0.04] hover:bg-slate-900/[0.08] text-slate-700 text-xs font-semibold flex items-center gap-1 shrink-0 cursor-pointer"
+                title="上传即识别，并保存到所有简历版本共用的母版资料库"
+              >
+                <FileCheck2 className="w-3.5 h-3.5 text-[#0071e3]" />
+                <span>母版资料</span>
+              </button>              {/* OS 26 Floating Document & Role-Lane Version Popover Sheet */}
               {showDocPopover && (
                 <div className="os26-floating-dock os26-popover-enter absolute left-0 top-full mt-2 w-88 rounded-2xl p-3 space-y-3 z-40">
                   {/* Header: Open Full Multi-Role Manager */}
@@ -1224,20 +1436,13 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => {
-                        commitResumeChange(
-                          {
-                            ...UPLOADED_PDF_EXACT_RESUME,
-                            sections: ensureSummarySection(UPLOADED_PDF_EXACT_RESUME.sections),
-                          },
-                          false
-                        );
                         setShowDocPopover(false);
-                        showToast('已载入您上传的 PDF 原版文字与 1:1 排版');
+                        setShowImportModal(true);
                       }}
                       className="w-full px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100/80 rounded-xl flex items-center gap-2 cursor-pointer"
                     >
                       <FileText className="w-3.5 h-3.5 text-[#0071e3]" />
-                      <span>一键填入上传的 PDF 原版简历</span>
+                      <span>导入自己的简历文件</span>
                     </button>
 
                     <div className="grid grid-cols-2 gap-1.5 pt-1">
@@ -1354,6 +1559,7 @@ export default function App() {
                 onDeleteRoleLane={handleDeleteRoleLane}
                 onExportSlotJSON={handleExportSlotJSON}
                 onOpenImportModal={() => setShowImportModal(true)}
+                onOpenMasterCompose={() => setShowMasterCompose(true)}
               />
             )}
 
@@ -1371,10 +1577,7 @@ export default function App() {
             )}
 
             {activeTab === 'ai-skills' && (
-              <AISkillLibraryCard
-                resume={resume}
-                onRequestAIOptimize={setAiOptimizeTarget}
-              />
+              <AISkillLibraryCard resume={resume} onRequestAIOptimize={setAiOptimizeTarget} />
             )}
 
             {activeTab === 'github' && (
@@ -1392,6 +1595,11 @@ export default function App() {
                   resume={resume}
                   onApplySummary={handleApplyTailoredSummary}
                   onAppendSkillKeyword={handleAppendSkillKeyword}
+                  onGetAtsPreflight={() => getExportQualityReport('ats')}
+                  onEditSection={(type) => {
+                    setActiveSectionId(resume.sections.find((section)=>section.type===type)?.id??null);
+                    setActiveTab('editor');
+                  }}
                 />
               </div>
             )}
@@ -1400,6 +1608,22 @@ export default function App() {
               <div className="os26-sheet-enter">
                 <TemplateStylePanel
                   style={resume.style}
+                  sections={resume.sections}
+                  onChangeSectionSpacing={(sectionId, spacingBeforePx) =>
+                    commitResumeChange((prev) => ({
+                      ...prev,
+                      sections: prev.sections.map((section) =>
+                        section.id === sectionId ? { ...section, spacingBeforePx } : section
+                      ),
+                    }), false)
+                  }
+                  onResetIndividualSectionSpacing={() =>
+                    commitResumeChange((prev) => ({
+                      ...prev,
+                      sections: prev.sections.map((section) => ({ ...section, spacingBeforePx: undefined })),
+                    }), false)
+                  }
+                  onRequestOnePageAI={() => setShowOnePageAI(true)}
                   onChangeStyle={(updater) =>
                     commitResumeChange(
                       (prev) => ({
@@ -1416,64 +1640,66 @@ export default function App() {
         </div>
 
         {/* Right Pane: Real-time A4 Paper Studio Desk with Floating OS 26 Glass Dock */}
-        <div className="lg:col-span-6 xl:col-span-7 flex flex-col h-[calc(100vh-53px)] relative">
+        <div ref={previewDeskRef} className="lg:col-span-6 xl:col-span-7 flex flex-col h-[calc(100vh-53px)] relative">
           {/* OS 26 Floating Glass Canvas Dock */}
           <div className="pt-3 px-4 flex justify-center z-20 shrink-0">
             <div className="os26-floating-dock rounded-2xl px-3 py-1.5 flex flex-wrap items-center justify-between gap-3 max-w-full">
-              {/* Segmented Template Switcher */}
-              <div className="flex items-center gap-0.5 p-0.5 bg-slate-900/[0.05] rounded-xl">
-                {[
-                  { id: 'pdf-classic', label: 'PDF同款双栏' },
-                  { id: 'modern', label: '现代极简' },
-                  { id: 'classic-ats', label: '经典ATS' },
-                  { id: 'creative-split', label: '创意分栏' },
-                ].map((t) => (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() =>
-                      commitResumeChange(
-                        (prev) => ({
-                          ...prev,
-                          style: { ...prev.style, template: t.id as TemplateId },
-                        }),
-                        false
-                      )
-                    }
-                    className={`os26-press px-2.5 py-1 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer ${
-                      resume.style.template === t.id
-                        ? 'bg-white text-slate-900 font-semibold shadow-2xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                ))}
+              {/* One-click full template gallery, retaining content and the current resume. */}
+              <div className="flex items-center gap-2 min-w-0 max-w-[270px]">
+                <div className="min-w-0">
+                  <div className="text-[10px] leading-none text-slate-500">当前版式</div>
+                  <div className="truncate text-xs font-semibold text-slate-800 mt-1">
+                    {getTemplateOption(resume.style.template).name}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('style')}
+                  className="os26-press shrink-0 px-2.5 py-1.5 text-xs font-semibold text-[#0071e3] bg-[#0071e3]/10 hover:bg-[#0071e3]/15 rounded-lg cursor-pointer"
+                  title="打开模板库，选择后直接在右侧 A4 画布预览，不影响简历内容"
+                >
+                  更换模板 · {TEMPLATE_CATALOG.length}
+                </button>
               </div>
 
               <span className="text-slate-300 hidden sm:inline" aria-hidden="true">|</span>
 
               {/* Real-time Page Fill Status (Unboxed Typography unless Action Button) */}
-              <div className="flex items-center gap-2 text-xs">
+              <div className="flex flex-col gap-0.5 text-xs">
                 {pageMetrics.isOverflowing ? (
                   <>
                     <span className="font-mono tabular-nums font-semibold text-red-600 whitespace-nowrap">
-                      超出1页 ({pageMetrics.fillPercent}%)
+                      {needsSinglePage(resume.style) ? '单页目标未达标' : '预览超出1页'} ({pageMetrics.fillPercent}%)
                     </span>
+                    <button type="button" onClick={() => setShowOnePageAI(true)}
+                      className="os26-press px-2.5 py-1 text-[11px] font-semibold bg-[#0071e3] hover:bg-[#0077ed] text-white rounded-lg whitespace-nowrap shrink-0 cursor-pointer">
+                      AI 一键精简
+                    </button>
                     <button
                       type="button"
                       onClick={handleAutoFitOnePage}
                       className="os26-press px-2.5 py-1 text-[11px] font-semibold bg-red-600 hover:bg-red-700 text-white rounded-lg flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <Minimize2 className="w-3 h-3" />
-                      一键收敛一页
+                      尝试单页排版
                     </button>
                   </>
                 ) : (
                   <span className="font-mono tabular-nums text-slate-600 whitespace-nowrap">
-                    单页 A4 · {pageMetrics.fillPercent}% 页高
+                    预览单页 A4 · {pageMetrics.fillPercent}% 页高
                   </span>
                 )}
+                <button type="button"
+                  aria-label="切换校招简历页数目标"
+                  aria-pressed={needsSinglePage(resume.style)}
+                  title="严格单页会拦截超过一页的导出；允许多页保留完整内容"
+                  onClick={() => commitResumeChange((prev) => ({ ...prev,
+                    style: { ...prev.style, pageGoal: needsSinglePage(prev.style) ? 'flexible' : 'one' },
+                  }), false)}
+                  className={'self-start text-[10px] whitespace-nowrap font-semibold cursor-pointer ' +
+                    (needsSinglePage(resume.style) ? 'text-[#0071e3]' : 'text-slate-500 hover:text-slate-800')}>
+                  目标：{needsSinglePage(resume.style) ? '严格单页' : '允许多页'} · 点击切换
+                </button>
               </div>
 
               <span className="text-slate-300 hidden sm:inline" aria-hidden="true">|</span>
@@ -1482,7 +1708,10 @@ export default function App() {
               <div className="flex items-center gap-1">
                 <button
                   type="button"
-                  onClick={() => setZoom((z) => Math.max(0.55, Number((z - 0.08).toFixed(2))))}
+                  onClick={() => {
+                    setZoom(Math.max(viewportWidth < 640 ? 0.35 : 0.55, Number((effectiveZoom - 0.08).toFixed(2))));
+                    setFitPreviewToWidth(false);
+                  }}
                   className="os26-press p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-900/[0.05] rounded-lg cursor-pointer"
                   title="缩小预览"
                 >
@@ -1490,15 +1719,18 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setZoom(0.82)}
-                  title="点击重置缩放至 82%"
+                  onClick={() => { setZoom(0.82); setFitPreviewToWidth(true); }}
+                  title="点击恢复自适应手机宽度（桌面重置为 82%）"
                   className="text-xs font-mono tabular-nums font-semibold text-slate-700 hover:text-[#0071e3] w-11 text-center cursor-pointer"
                 >
-                  {Math.round(zoom * 100)}%
+                  {Math.round(effectiveZoom * 100)}%
                 </button>
                 <button
                   type="button"
-                  onClick={() => setZoom((z) => Math.min(1.15, Number((z + 0.08).toFixed(2))))}
+                  onClick={() => {
+                    setZoom(Math.min(1.15, Number((effectiveZoom + 0.08).toFixed(2))));
+                    setFitPreviewToWidth(false);
+                  }}
                   className="os26-press p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-900/[0.05] rounded-lg cursor-pointer"
                   title="放大预览"
                 >
@@ -1508,11 +1740,66 @@ export default function App() {
             </div>
           </div>
 
+          {activeAiCompactReview && (
+            <section role="region" aria-label="精简完成后的 A4 检查"
+              className="mx-4 mt-3 rounded-xl border border-slate-200 bg-white/95 px-4 py-3 shadow-sm shrink-0 space-y-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 space-y-1">
+                  <p className="text-[13px] font-bold text-slate-900">
+                    {activeAiCompactReview.kind === 'spacing' ? '已压缩间距并更新 A4 预览' : `已确认精简 ${activeAiCompactReview.count} 处 · A4 预览已更新`}
+                  </p>
+                  <p className={'text-[12px] font-semibold ' + (activeAiCompactReview.metrics.isOverflowing ? 'text-amber-800' : 'text-slate-700')}>
+                    {activeAiCompactReview.metrics.isOverflowing
+                      ? `预览仍超出一页 · 约占 A4 页高 ${activeAiCompactReview.metrics.fillPercent}%`
+                      : `预览未超出一页 · 约占 A4 页高 ${activeAiCompactReview.metrics.fillPercent}%`}
+                  </p>
+                </div>
+                <button type="button" onClick={() => setLastAiCompactReview(null)}
+                  aria-label="关闭精简结果栏" className="shrink-0 px-2 py-1 text-[11px] text-slate-500 hover:text-slate-800 cursor-pointer">
+                  关闭
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                {activeAiCompactReview.metrics.isOverflowing
+                  ? '精简未达到一页目标，可进一步收紧留白或继续编辑。严格单页模式不会允许超页的高清 PDF 导出。'
+                  : '此处是当前视觉模板的 A4 预览测量，不等于最终 PDF 已验收；导出时仍会独立检查页数和字体。'}
+              </p>
+              <div className="flex flex-wrap gap-2 items-center">
+                <button type="button" onClick={handleDownloadImagePDF} disabled={isExportingPDF}
+                  className="os26-press px-3 py-1.5 rounded-lg bg-[#0071e3] text-white text-[11px] font-semibold disabled:opacity-50 cursor-pointer">
+                  检查并导出高清 PDF
+                </button>
+                <button type="button" onClick={handleExportPDF}
+                  className="os26-press px-3 py-1.5 rounded-lg border border-slate-200 text-slate-700 text-[11px] font-semibold cursor-pointer">
+                  检查 ATS 文字 PDF
+                </button>
+                {activeAiCompactReview.metrics.isOverflowing && (
+                  <button type="button" onClick={handleTightenAfterAi}
+                    className="os26-press px-3 py-1.5 rounded-lg border border-slate-200 text-slate-700 text-[11px] font-semibold cursor-pointer">
+                    确认压缩间距
+                  </button>
+                )}
+                <button type="button" onClick={() => {
+                  setActiveTab('editor');
+                  if (window.innerWidth < 1024) requestAnimationFrame(() =>
+                    inspectorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+                }} className="os26-press px-3 py-1.5 rounded-lg text-slate-700 text-[11px] font-semibold hover:bg-slate-50 cursor-pointer">
+                  继续编辑
+                </button>
+                <button type="button" onClick={() => { setLastAiCompactReview(null); handleUndo(); }}
+                  disabled={!canUndo}
+                  className="os26-press px-3 py-1.5 rounded-lg text-slate-700 text-[11px] font-semibold hover:bg-slate-50 disabled:opacity-40 cursor-pointer">
+                  撤销上一步
+                </button>
+              </div>
+            </section>
+          )}
+
           {/* Scrollable A4 Viewport */}
           <div className="flex-1 overflow-auto px-6 pt-4 pb-10 flex justify-center items-start">
             <div
               style={{
-                transform: `scale(${zoom})`,
+                transform: `scale(${effectiveZoom})`,
                 transformOrigin: 'top center',
               }}
               className="transition-transform duration-200 ease-out pb-12"
@@ -1526,13 +1813,57 @@ export default function App() {
                 onToggleAvatarColumn={handleToggleAvatarColumn}
                 onInlineUpdateResume={handleInlinePreviewChange}
                 onAutoFitOnePage={handleAutoFitOnePage}
-                onPageMetricsChange={setPageMetrics}
+                onPageMetricsChange={handlePageMetricsChange}
                 onRequestAIOptimize={setAiOptimizeTarget}
               />
             </div>
           </div>
         </div>
       </div>
+
+      {pendingExport && (
+        <ExportQualityDialog
+          report={pendingExport.report}
+          busy={isExportingPDF}
+          onClose={() => setPendingExport(null)}
+          onContinue={continueReviewedExport}
+        />
+      )}
+
+      {showOnePageAI && (
+        <OnePageAICompactDialog
+          resume={resume}
+          onClose={() => setShowOnePageAI(false)}
+          onApplySpacing={() => {
+            commitResumeChange((prev) => ({
+              ...prev,
+              style: compactOnePageSpacing(prev.style),
+            }), false);
+            showToast('已确认压缩间距，可撤销。请重新检查 A4 页数。');
+          }}
+          onApply={(updated, count) => {
+            // One confirmation, one undo step. Materialize the fact-ledger
+            // reconciliation once so the measured document has a stable ID.
+            const sourceSnapshot = JSON.stringify(resume);
+            const prepared = reconcileImportFactLedger(resume, updated);
+            if (JSON.stringify(prepared) === sourceSnapshot) return;
+            pendingAiCompactCountRef.current = {
+              count, snapshot: JSON.stringify(prepared), slotId: activeSlotId, kind: 'content',
+            };
+            setLastAiCompactReview(null);
+            commitResumeChange((prev) =>
+              JSON.stringify(prev) === sourceSnapshot ? prepared : prev,
+            false);
+            setActiveTab('editor');
+            // The right-hand A4 desk is below the inspector on small screens.
+            requestAnimationFrame(() => {
+              if (window.innerWidth < 1024) {
+                previewDeskRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }
+            });
+          }}
+        />
+      )}
 
       {/* Universal Module AI Optimization Modal */}
       <AIOptimizeModal
@@ -1545,6 +1876,14 @@ export default function App() {
         }}
       />
 
+
+      <MasterComposeDialog
+        open={showMasterCompose}
+        resume={resume}
+        onClose={() => setShowMasterCompose(false)}
+        onCreate={handleCreateFromMaster}
+      />
+
       {/* Universal Multimodal Resume Import Modal */}
       <ResumeImportModal
         isOpen={showImportModal}
@@ -1554,24 +1893,51 @@ export default function App() {
         onImportResume={handleImportParsedResume}
       />
 
-      {/* =====================================================================
-          OFFSCREEN 1:1 A4 CAPTURE ROOT & PRINT-ONLY ROOT
-          Used by domToCanvas + jsPDF for direct 300-DPI PDF file download
-         ===================================================================== */}
-      <div
-        aria-hidden="true"
-        className="fixed -left-[9999px] top-0 pointer-events-none z-[-1] print-only-root pdf-capture-surface"
-      >
-        <div ref={pdfCaptureRef} className="w-[210mm] bg-white">
-          <ResumePreview
-            resume={{
-              ...resume,
-              style: {
-                ...resume.style,
-                showPageBreakGuide: false,
-              },
-            }}
-          />
+      <EvidenceAttachmentsModal
+        isOpen={showEvidenceModal}
+        resume={resume}
+        onClose={() => setShowEvidenceModal(false)}
+        onAdoptFact={(source,factIndex) => {
+          try {
+            const applied = applyMasterEvidenceFact(resume,source,factIndex);
+            if(applied===resume)return false;
+            // Refuse a late write after a version switch or concurrent edit.
+            commitResumeChange((current)=>current===resume?applied:current,false);
+            showToast('已将候选事实写入当前简历并记录附件来源，支持撤销。');
+            return true;
+          }catch(error){
+            showToast(error instanceof Error?error.message:'未能采用候选事实，简历保持不变。');
+            return false;
+          }
+        }}      />
+
+      {/* Image PDF retains the selected visual template and screenshot rendering. */}
+      <div aria-hidden="true" className="fixed -left-[9999px] top-0 pointer-events-none z-[-1] pdf-image-capture">
+        <div ref={pdfCaptureRef} className="w-[210mm] bg-white pdf-capture-surface">
+          <ResumePreview resume={{
+            ...resume,
+            style: { ...resume.style, showPageBreakGuide: false },
+          }}/>
+        </div>
+      </div>
+
+      {/* ATS PDF reuses the same resume facts and section ordering, not a second data store.
+          Only printing shows this text-first, monochrome, single-column layout. */}
+      <div ref={atsPrintRef} aria-hidden="true"
+        className="fixed -left-[9999px] top-0 pointer-events-none z-[-1] print-only-root">
+        <div className="w-[186mm] bg-white ats-print-surface">
+          <ResumePreview resume={{
+            ...resume,
+            basics: { ...resume.basics, showAvatar: false },
+            style: {
+              ...resume.style,
+              template: 'classic-ats',
+              accentColor: '#262626',
+              showIcons: false,
+              showPageBreakGuide: false,
+              useThemeColorInPdf: false,
+            },
+          }}/>
         </div>
       </div>
     </div>

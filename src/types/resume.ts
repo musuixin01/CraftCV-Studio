@@ -1,4 +1,8 @@
-export type TemplateId = 'pdf-classic' | 'modern' | 'classic-ats' | 'creative-split';
+export type TemplateId =
+  | 'pdf-classic' | 'modern' | 'classic-ats' | 'creative-split'
+  | 'reactive-meowth' | 'reactive-onyx' | 'reactive-bronzor'
+  | 'render-engineering' | 'render-engineering-classic' | 'render-harvard'
+  | 'awesome-inspired' | 'resumesample-engineer';
 
 export type SectionType =
   | 'summary'
@@ -19,6 +23,8 @@ export interface SectionConfig {
   visible: boolean;
   column?: SectionColumn;
   customSectionId?: string;
+  /** Optional gap immediately before this module in px; undefined inherits global spacing. */
+  spacingBeforePx?: number;
 }
 
 export interface BasicsInfo {
@@ -45,6 +51,9 @@ export interface BasicsInfo {
   summary: string;
 }
 
+/** Source-backed grade data is retained structurally, not silently inserted into every A4 template. */
+export interface CourseGradeItem { id: string; course: string; score: string }
+
 export interface EducationItem {
   id: string;
   school: string;
@@ -55,6 +64,9 @@ export interface EducationItem {
   gpa: string;
   ranking: string;
   courses: string;
+  /** Kept separate: never merge the weighted percentage with GPA/5. */
+  weightedAverage?: string;
+  courseGrades?: CourseGradeItem[];
   honors: string;
 }
 
@@ -68,6 +80,17 @@ export interface ProjectItem {
   techStack: string[];
   summary: string;
   bullets: string[];
+  /** Public GitHub materials used to draft this project. Not proof of personal contribution. */
+  evidence?: {
+    repository: string;
+    revision: string;
+    commitShas: string[];
+    sourceFiles: Array<{ path: string; url: string }>;
+    /** Code indicators with source links, never personal-contribution verification. */
+    codeSignals?: Array<{ technology: string; category: string; sourceFiles: Array<{ path: string; url: string }> }>;
+    warnings: string[];
+    notice: string;
+  };
 }
 
 export interface ExperienceItem {
@@ -90,6 +113,8 @@ export interface SkillCategory {
 
 export interface AwardItem {
   id: string;
+  /** The existing certificate-and-award section can host either kind. */
+  credentialType?: 'award' | 'certificate';
   title: string;
   issuer: string;
   date: string;
@@ -117,11 +142,50 @@ export interface ResumeStyleConfig {
   fontSize: 'sm' | 'md' | 'lg';
   lineHeight: 'tight' | 'normal' | 'relaxed';
   pageMargin: 'compact' | 'standard' | 'generous';
+  /** Optional export constraint; older resumes remain flexible by default. */
+  pageGoal?: 'one' | 'flexible';
   showPageBreakGuide: boolean;
   showIcons: boolean;
   leftColumnWidth?: number;
   sectionSpacing?: number;
+  /** Optional global gap between project/experience entries; absent uses template defaults. */
+  itemSpacingPx?: number;
+  /** Optional gap after module heading and before module content. */
+  headingContentSpacingPx?: number;
+  /** Optional gap between bullet points within projects and experience. */
+  bulletSpacingPx?: number;
   useThemeColorInPdf?: boolean;
+}
+
+export type ResumeFactClaimType =
+  | 'identity' | 'education' | 'role' | 'skill' | 'action' | 'metric' | 'outcome' | 'award' | 'date';
+export type ResumeFactStatus =
+  | 'verified-source' | 'user-asserted' | 'inferred-suggestion' | 'missing' | 'conflicting';
+
+/** Local, non-authoritative provenance snapshot. It never proves an extracted claim is true. */
+export interface ResumeFactRecord {
+  factId: string;
+  path: string;
+  claimType: ResumeFactClaimType;
+  originalValue: string;
+  normalizedValue: string;
+  sources: Array<{
+    sourceId: string;
+    kind: 'ai-file-extraction' | 'ai-pasted-text';
+    label: string;
+    capturedAt: string;
+  }>;
+  status: ResumeFactStatus;
+  candidateConfirmed: boolean;
+  editedAt: string;
+  versionId: string;
+  sensitivity: 'personal' | 'normal';
+  cloudAllowed: boolean;
+}
+
+export interface ResumeFactLedger {
+  version: 1;
+  records: ResumeFactRecord[];
 }
 
 export interface ResumeDocument {
@@ -137,6 +201,8 @@ export interface ResumeDocument {
   awards: AwardItem[];
   customSections: CustomSection[];
   style: ResumeStyleConfig;
+  /** Optional RGS provenance ledger; older documents load without it. */
+  factLedger?: ResumeFactLedger;
 }
 
 export interface ResumeSlot {
@@ -168,6 +234,7 @@ export interface GitHubRepoSummary {
 }
 
 export interface JDMatchResult {
+  summaryReviewNotice?: string;
   matchScore: number;
   matchedKeywords: string[];
   missingKeywords: string[];
